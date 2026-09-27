@@ -1,0 +1,13 @@
+# ---- 构建产物（都不要进版本库）----
+.gradle/
+build/
+out/
+.kotlin/
+.intellijPlatform/
+
+# ---- 本机配置 ----
+.idea/
+*.iml
+local.properties
+# 本机 Android Studio 路径写在这里（不同机器不一样，见 README）
+# studioPath=D:/Android studio

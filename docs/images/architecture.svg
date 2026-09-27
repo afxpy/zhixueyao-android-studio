@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="470" viewBox="0 0 880 470" font-family="'Segoe UI','Microsoft YaHei',sans-serif">
+  <!-- 架构示意（暗色主题）-->
+  <rect width="880" height="470" fill="#1E1F22"/>
+  <defs>
+    <marker id="arw" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0 0 L8 3 L0 6 z" fill="#6E7781"/>
+    </marker>
+  </defs>
+
+  <!-- 界面层 -->
+  <rect x="24" y="24" width="180" height="424" rx="10" fill="#2B2D30" stroke="#3C3F44"/>
+  <text x="114" y="50" fill="#FF8A7A" font-size="12.5" font-weight="600" text-anchor="middle">界面层 · ui/</text>
+  <g font-size="11.5" fill="#DFE1E5">
+    <text x="42" y="78">ChatPanel</text>
+    <text x="42" y="100">MessageBubble</text>
+    <text x="42" y="122">ImagePreviewDialog</text>
+    <text x="42" y="144">HistoryGrouping</text>
+    <text x="42" y="166">TableSection</text>
+    <text x="42" y="188">MarkdownRenderer</text>
+  </g>
+  <text x="42" y="222" fill="#7E848C" font-size="10.5">消息版本 / 折叠 / 滚动跟随</text>
+  <text x="42" y="240" fill="#7E848C" font-size="10.5">流式节流 / 定时器清理</text>
+
+  <line x1="204" y1="236" x2="240" y2="236" stroke="#6E7781" stroke-width="1.4" marker-end="url(#arw)"/>
+
+  <!-- Agent 层 -->
+  <rect x="248" y="24" width="200" height="424" rx="10" fill="#2B2D30" stroke="#3C3F44"/>
+  <text x="348" y="50" fill="#FF8A7A" font-size="12.5" font-weight="600" text-anchor="middle">Agent 层 · agent/</text>
+  <g font-size="11.5" fill="#DFE1E5">
+    <text x="266" y="78">AgentRunner</text>
+    <text x="266" y="100">ContextCompactor</text>
+    <text x="266" y="122">Skills</text>
+    <text x="266" y="144">SessionWorkspace</text>
+    <text x="266" y="166">Sandbox</text>
+    <text x="266" y="188">ReferenceChecker</text>
+    <text x="266" y="210">FileSafety</text>
+  </g>
+  <text x="266" y="244" fill="#7E848C" font-size="10.5">多步循环 / steer 注入</text>
+  <text x="266" y="262" fill="#7E848C" font-size="10.5">每轮瘦身旧结果与旧图</text>
+  <text x="266" y="280" fill="#7E848C" font-size="10.5">超预算 → LLM 摘要</text>
+  <text x="266" y="298" fill="#7E848C" font-size="10.5">软删除 + 可还原</text>
+
+  <line x1="448" y1="236" x2="484" y2="236" stroke="#6E7781" stroke-width="1.4" marker-end="url(#arw)"/>
+
+  <!-- 工具层 -->
+  <rect x="492" y="24" width="176" height="424" rx="10" fill="#2B2D30" stroke="#3C3F44"/>
+  <text x="580" y="50" fill="#FF8A7A" font-size="12.5" font-weight="600" text-anchor="middle">工具层 · tools/</text>
+  <g font-size="11.5" fill="#DFE1E5">
+    <text x="510" y="78">FileTools</text>
+    <text x="510" y="100">SearchTools</text>
+    <text x="510" y="122">BuildTools</text>
+    <text x="510" y="144">MediaTools</text>
+    <text x="510" y="166">TaskTools</text>
+    <text x="510" y="188">SkillTool</text>
+    <text x="510" y="210">ManageTools</text>
+  </g>
+  <text x="510" y="244" fill="#7E848C" font-size="10.5">21 个内置工具</text>
+  <text x="510" y="262" fill="#7E848C" font-size="10.5">SVG → VectorDrawable</text>
+  <text x="510" y="280" fill="#7E848C" font-size="10.5">工具结果按 token 裁剪</text>
+
+  <line x1="668" y1="236" x2="704" y2="236" stroke="#6E7781" stroke-width="1.4" marker-end="url(#arw)"/>
+
+  <!-- 接入层 -->
+  <rect x="712" y="24" width="144" height="200" rx="10" fill="#2B2D30" stroke="#3C3F44"/>
+  <text x="784" y="50" fill="#FF8A7A" font-size="12.5" font-weight="600" text-anchor="middle">接入 · llm/</text>
+  <g font-size="11.5" fill="#DFE1E5">
+    <text x="730" y="78">LlmProvider</text>
+    <text x="730" y="100">Providers</text>
+    <text x="730" y="122">ModelWindows</text>
+    <text x="730" y="144">ThinkingLevel</text>
+  </g>
+  <text x="730" y="176" fill="#7E848C" font-size="10.5">OpenAI 兼容</text>
+  <text x="730" y="194" fill="#7E848C" font-size="10.5">SSE 流式 + 取消</text>
+
+  <rect x="712" y="240" width="144" height="208" rx="10" fill="#2B2D30" stroke="#3C3F44"/>
+  <text x="784" y="266" fill="#FF8A7A" font-size="12.5" font-weight="600" text-anchor="middle">接入 · mcp/</text>
+  <g font-size="11.5" fill="#DFE1E5">
+    <text x="730" y="294">McpClient</text>
+    <text x="730" y="316">McpManager</text>
+    <text x="730" y="338">Stdio / HTTP</text>
+  </g>
+  <text x="730" y="370" fill="#7E848C" font-size="10.5">分片等待</text>
+  <text x="730" y="388" fill="#7E848C" font-size="10.5">取消立刻生效</text>
+  <text x="730" y="406" fill="#7E848C" font-size="10.5">也能对外提供</text>
+
+  <!-- 底部：数据落点 -->
+  <rect x="24" y="462" width="832" height="0" fill="none"/>
+</svg>

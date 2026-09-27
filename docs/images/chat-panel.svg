@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="640" viewBox="0 0 920 640" font-family="'Segoe UI','Microsoft YaHei',sans-serif">
+  <!-- 说明：这是按插件真实配色/布局绘制的示意图（暗色主题） -->
+  <defs>
+    <clipPath id="panelClip"><rect x="152" y="16" width="752" height="608" rx="10"/></clipPath>
+    <linearGradient id="sendGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FF7B6B"/><stop offset="100%" stop-color="#FF6B5B"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 背景（IDE） -->
+  <rect width="920" height="640" fill="#1E1F22"/>
+
+  <!-- 左侧 IDE 工具栏 -->
+  <rect x="0" y="0" width="48" height="640" fill="#2B2D30"/>
+  <rect x="14" y="22" width="20" height="20" rx="4" fill="#4E5257"/>
+  <rect x="14" y="56" width="20" height="20" rx="4" fill="#4E5257"/>
+  <rect x="14" y="90" width="20" height="20" rx="4" fill="#5A6067"/>
+  <rect x="14" y="124" width="20" height="20" rx="4" fill="#4E5257"/>
+  <circle cx="24" cy="600" r="12" fill="#3C3F44"/>
+  <text x="24" y="605" fill="#DFE1E5" font-size="12" text-anchor="middle">药</text>
+  <!-- 工具窗口标签 -->
+  <rect x="48" y="16" width="104" height="34" rx="8" fill="#3C3F44"/>
+  <circle cx="66" cy="33" r="6" fill="#FF6B5B"/>
+  <text x="80" y="38" fill="#DFE1E5" font-size="13" font-weight="600">止血药</text>
+
+  <!-- ============ 插件面板 ============ -->
+  <g clip-path="url(#panelClip)">
+    <rect x="152" y="16" width="752" height="608" fill="#1E1F22"/>
+
+    <!-- 顶栏 -->
+    <rect x="152" y="16" width="752" height="46" fill="#2B2D30"/>
+    <circle cx="176" cy="39" r="7" fill="#FF6B5B"/>
+    <text x="192" y="44" fill="#DFE1E5" font-size="14" font-weight="600">止血药</text>
+    <circle cx="252" cy="39" r="4" fill="#5FBF7F"/>
+    <!-- 顶栏右侧图标 -->
+    <g stroke="#9DA3AB" stroke-width="1.5" fill="none" stroke-linecap="round">
+      <!-- 历史（时钟） -->
+      <circle cx="824" cy="39" r="7"/>
+      <path d="M824 35 L824 39 L827 41"/>
+      <!-- 任务清单（三条线） -->
+      <path d="M850 35 L864 35 M850 39 L864 39 M850 43 L864 43"/>
+      <!-- 清空（垃圾桶） -->
+      <path d="M880 34 L894 34 M883 34 L883 45 L891 45 L891 34 M886 34 L886 32 L888 32 L888 34"/>
+    </g>
+    <line x1="152" y1="62" x2="904" y2="62" stroke="#3C3F44" stroke-width="1"/>
+
+    <!-- 用户消息（右侧） -->
+    <rect x="556" y="80" width="332" height="52" rx="10" fill="#2B3A55"/>
+    <text x="576" y="102" fill="#DFE1E5" font-size="13">看看项目结构，然后给登录页加个加载状态</text>
+    <text x="576" y="120" fill="#DFE1E5" font-size="13">别动别的文件</text>
+    <text x="840" y="150" fill="#7E848C" font-size="11" text-anchor="end">14:22</text>
+
+    <!-- 助手气泡 -->
+    <rect x="176" y="166" width="712" height="404" rx="10" fill="#2B2D30"/>
+    <circle cx="196" cy="190" r="8" fill="#FF6B5B"/>
+    <text x="212" y="195" fill="#DFE1E5" font-size="13" font-weight="600">止血药</text>
+    <text x="268" y="195" fill="#9DA3AB" font-size="11">· 已完成 4 秒</text>
+
+    <!-- 思维链（折叠） -->
+    <rect x="196" y="210" width="672" height="26" rx="6" fill="#26282B"/>
+    <text x="210" y="227" fill="#9DA3AB" font-size="12">▸ 思考过程（12 步，点击展开）</text>
+
+    <!-- 正文 -->
+    <text x="196" y="258" fill="#DFE1E5" font-size="13">我先读了工程结构，发现是单模块应用。改动只有一处：</text>
+
+    <!-- 工具卡 -->
+    <rect x="196" y="274" width="672" height="56" rx="8" fill="#2E3135" stroke="#3C3F44"/>
+    <text x="212" y="296" fill="#5FBF7F" font-size="13" font-weight="600">✓</text>
+    <text x="232" y="296" fill="#DFE1E5" font-size="12" font-weight="600">read_file</text>
+    <text x="300" y="296" fill="#9DA3AB" font-size="11">LoginActivity.kt · 128 行 · 42ms</text>
+    <text x="212" y="316" fill="#7E848C" font-size="11" font-family="monospace">app/src/main/java/cn/demo/LoginActivity.kt</text>
+
+    <!-- 代码块卡片 -->
+    <rect x="196" y="342" width="672" height="118" rx="8" fill="#2E3135" stroke="#3C3F44"/>
+    <text x="212" y="363" fill="#9DA3AB" font-size="11" font-family="monospace">kotlin</text>
+    <rect x="740" y="350" width="52" height="22" rx="6" fill="#3C3F44"/>
+    <text x="766" y="365" fill="#DFE1E5" font-size="11" text-anchor="middle">复制</text>
+    <rect x="800" y="350" width="52" height="22" rx="6" fill="#4A3A38"/>
+    <text x="826" y="365" fill="#FF8A7A" font-size="11" text-anchor="middle">应用</text>
+    <rect x="212" y="378" width="640" height="70" rx="6" fill="#1E1F22"/>
+    <text x="224" y="398" fill="#C792EA" font-size="11.5" font-family="monospace">private fun setLoading(show: Boolean) {</text>
+    <text x="224" y="414" fill="#DFE1E5" font-size="11.5" font-family="monospace">    progressBar.isVisible = show</text>
+    <text x="224" y="430" fill="#6CB6FF" font-size="11.5" font-family="monospace">    loginButton.isEnabled = !show</text>
+    <text x="224" y="446" fill="#DFE1E5" font-size="11.5" font-family="monospace">}</text>
+
+    <!-- 图片产物卡 -->
+    <rect x="196" y="472" width="120" height="82" rx="8" fill="#2E3135" stroke="#3C3F44"/>
+    <rect x="206" y="482" width="100" height="52" rx="4" fill="#F5F1E8"/>
+    <circle cx="256" cy="502" r="11" fill="#F0C070"/>
+    <path d="M206 534 L232 512 L254 530 L272 516 L306 534 Z" fill="#5C7A6B"/>
+    <text x="256" y="546" fill="#9DA3AB" font-size="10" text-anchor="middle">abstract_sunrise.svg</text>
+    <text x="330" y="500" fill="#9DA3AB" font-size="10.5">单击预览 · 左右翻页</text>
+
+    <!-- 页脚 -->
+    <text x="852" y="552" fill="#7E848C" font-size="10.5" text-anchor="end">gpt-6-sol · 14:22 · 18k tokens</text>
+
+    <!-- 状态栏 + 输入区 -->
+    <line x1="152" y1="578" x2="904" y2="578" stroke="#3C3F44"/>
+    <text x="176" y="598" fill="#7E848C" font-size="11">就绪 · 仅项目内</text>
+    <rect x="176" y="606" width="712" height="0" fill="none"/>
+  </g>
+
+  <!-- 输入区（面板外一层，示意） -->
+  <rect x="152" y="596" width="752" height="28" fill="#1E1F22"/>
+  <rect x="176" y="600" width="672" height="0" fill="none"/>
+  <text x="176" y="616" fill="#6E7781" font-size="11.5">描述你想做的事，Enter 发送 / Shift+Enter 换行</text>
+  <rect x="700" y="600" width="30" height="30" rx="8" fill="#3C3F44"/>
+  <path d="M719 608 L711 616 a3.2 3.2 0 0 0 4.5 4.5 L723 613 a2.2 2.2 0 0 0 -3.1-3.1 L713 617"
+        stroke="#DFE1E5" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="886" cy="615" r="16" fill="url(#sendGrad)"/>
+  <path d="M879 615 L893 615 M888 610 L893 615 L888 620" stroke="#fff" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
