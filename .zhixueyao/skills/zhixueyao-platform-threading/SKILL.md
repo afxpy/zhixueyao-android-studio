@@ -127,6 +127,31 @@ absolute.startsWith(base)   // ✗ 项目里放一个 link -> C:/Windows 就废�
 新建文件还不存在时，用**最近的已存在祖先**判断。提示里要写出真实路径，
 否则用户不知道为什么被拒。
 
+## 10. Git Bash 会改写参数里的 `:` —— 别用它验证「文件在不在远端」
+
+**症状**：`git cat-file -e "origin/main:path/to/file"` 报「缺」，
+但 `git ls-tree -r origin/main` 明明列着这个文件。
+
+**原因**：Git Bash（MSYS2）对参数做 POSIX 路径转换，
+`a:b` 在它眼里像「盘符路径」，被改写成 `a;b`。报错信息里能看到轨迹：
+
+```
+fatal: ambiguous argument 'origin\main;.zhixueyao\skills\...':
+unknown revision or path not in the working tree
+        ^^^^^   ^^^^^^   ← 冒号变分号、斜杠变反斜杠
+```
+
+**危险点**：它**不报错、只改内容**，于是验证结果是**假阴性** ——
+你会以为推送失败、去重推一遍，或者白查半天。
+
+**规避**：
+1. 用 `export MSYS_NO_PATHCONV=1`（本条最省事）
+2. 或者换一个不含 `:` 的验证方式：`git ls-tree -r origin/main --name-only | grep 路径`
+3. `git show` / `git cat-file` 这类带 `rev:path` 的写法都要小心
+
+**通用规则**：**在 Windows 的 Git Bash 里，任何含 `:` 的参数都可能被偷偷改写。**
+（这个坑和「改文件别用 bash 内联字符串」是同一族：shell 会先动你的字符串。）
+
 ## 9. 改文件用**脚本文件**，别用 bash 内联字符串（被咬了三次）
 
 用 `python -c "..."` 或 heredoc 改文件时，**shell 会先做命令替换**：
