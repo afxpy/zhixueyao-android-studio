@@ -1,6 +1,7 @@
 ---
 name: zhixueyao-verify-probe
 description: 这个工程怎么离线验证改动——探针怎么写、跑什么、headless 环境哪些验不了。改完代码要证明改动生效时读。
+triggers: 验证, 探针, 怎么证明, 回归, 发布前检查
 ---
 
 # 止血药 · 离线验证方法论
@@ -70,6 +71,136 @@ if (java.awt.GraphicsEnvironment.isHeadless()) {
   图片预算那题，预算 2 就是**保留最新 2 张**，不是「全部砍掉」
 - 探针里记得 `System.exit(0)`：起了 `HttpServer` 之类非守护线程，JVM 不会自己退
 
+## ★★ 对照组：防止「假通过」（最重要的纪律）
+
+**背景**：有两个场景曾经**绿着但什么都没验到**。
+
+```java
+// 原意：验证「超时后进程会被杀掉」
+var r = run(slowCmd, timeout = 1.5s);
+judge("按时超时", ms < 6000);        // ← 用的却是 git help -a（183ms 就跑完）
+```
+命令根本没慢到触发超时，`timedOut` 是 false，但「耗时 < 6 秒」**照样成立**。
+取消场景同样：取消标志还没设置，命令已经结束了。
+
+根因：**只断言了「结果」，没断言「前提」**。
+
+### 规矩
+
+> 凡是测**超时 / 取消 / 并发 / 缓存 / 性能**的场景，
+> 必须先跑一次**对照组**证明「不加干预时，它确实会慢 / 会冲突」。
+> **对照组不过，实验组的结果一律不算数。**
+
+```java
+// 对照组：不干预，证明它真的要跑好几秒
+long plainMs = ProbeKit.timed(() -> run(slowCmd, timeout = 30s));
+ProbeKit.control("慢命令确实要跑 >6 秒", plainMs > 6_000, plainMs + "ms");
+
+// 实验组：设 1.5 秒超时，证明被终止了
+var r = run(slowCmd, timeout = 1.5s);
+ProbeKit.judge("按时超时且被终止", r.timedOut() && ms < plainMs / 2, "");
+```
+
+`ProbeKit`（探针目录下的 `ProbeKit.java`，已编译成 class）提供：
+`judge` / **`control`** / `timed` / `timedValue` / `summary`。
+`summary()` **用退出码表达成败**（0 通过 / 1 不过），比让人去 grep 输出可靠得多。
+
+### 对照组失败不等于产品有 bug
+
+这点要分清：**对照组失败 = 测试设计有问题**（前提不成立），
+不是被测代码坏了。所以 `ProbeKit` 把它们**分开计数**，
+否则会被当成产品 bug 去查半天。
+
+### 附带要求：断言要落在**状态字段**上
+
+时间断言只能作为**辅助**。比如「取消生效了」应该断言
+`r.cancelled() == true`，而不是只断言「耗时 < 2 秒」。
+只断言时间的话，命令快一点、机器快一点都会让它假通过。
+
+### 还有一条：断言要符合**真实契约**，别凭想当然
+
+写「取消后应该没有任何产出」时被我写成了 `finalText == null`，
+结果失败 —— 查代码才发现 `AgentRunner` 的取消分支**确实会调 `onComplete`**
+（带已累积的部分文本），因为界面要靠它把气泡收尾。
+**这是正确的**，错的是我的想象。
+
+遇到「断言失败」，先分清是**代码错了**还是**你的预期错了**。
+探针的价值之一就是逼你把契约看清楚。
+
+## 🔴 「测试通过」≠「测试真的跑了」（本项目最严重的一次过程事故）
+
+做 `regress.sh` 之后第一次跑，汇总里出现 **13 个退出码非零**，
+而当时 grep 判定说它们是「干净的」。逐个查下来：
+
+```
+错误: 编译失败
+    原因: 实际参数列表和形式参数列表长度不同
+```
+
+**10 个真实探针编译失败 → 什么都没执行 → 而我前几轮一直说的「全量回归零失败」是假的。**
+31 个探针里有 10 个是摆设。
+
+### 为什么一直没发现
+
+判定一直是「grep 输出里的失败关键字」，而「错误: 编译失败」**确实在关键词列表里**。
+但 `grep` 在 Windows 下因为中文输出**被当成二进制**，匹配**静默失效**了 ——
+没有报错、没有提示，判定直接返回「干净」。
+（这正是我在 `regress.sh` 注释里当「理论风险」写下的那条，结果是正在发生的现实。）
+
+### 根因：改公开 API 签名之后没跑回归
+
+| 探针 | 缺什么 |
+|---|---|
+| 10 个界面探针 | `MessageBubble.finalize` 加了 `stopped` / `replay` |
+| VariantProbe | `ChatMessage` 构造加了 `promptTokens` / `completionTokens` |
+| ToolCardsCapProbe | `ToolResult` 构造加了 `attachments` |
+| ReferenceCheckProbe | `ReferenceChecker.check` 加了 `extraKnownNames` |
+| InputHeightProbe | `MockProject` 的平台构造签名变了（`app` → `PicoContainer`） |
+
+**Java 调 Kotlin 时默认参数不存在，必须全给 —— 所以「加一个带默认值的参数」
+就是一次破坏性变更。** 每次都会静默杀掉一批探针。
+
+### 三条纪律
+
+1. **判定以退出码为准**。`ProbeKit.summary()` 会用 0/1 表达成败；
+   没迁过去的探针至少也要 `System.exit(0)` 明确表示通过。
+   **grep 只能当兜底，且不要在中文环境下信它。**
+2. **改任何公开方法的签名后，立刻跑一次全量回归。**
+   这是唯一能发现「探针批量失效」的时机。
+3. **探针不要依赖平台的内部测试类**（`MockProject` 这类）。
+   它们的构造签名会随平台版本变 —— 用 `Project` 动态代理，
+   探针通常只需要 `basePath` 可用。
+
+## 「跳过」要单独统计，不能算通过
+
+`InputHeightProbe` 要 `new` 一个真实的 `ChatPanel`，而它的构造函数里装 `DropTarget`
+—— headless 下直接抛 `HeadlessException`。**它从写出来那天起就没执行过。**
+
+处理方式：探针开头显式判断并打印 `[SKIP]` 标记，`regress.sh` 见到就计入**单独的跳过栏**。
+
+> **跳过既不是通过也不是失败。**
+> 算成通过 = 假装验过了；算成失败 = 让人去找一个根本不存在的 bug。
+
+汇总长这样：
+
+```
+通过 52 / 不过 0 / 跳过 1（共 53 条）
+
+跳过的探针（需真机或在有图形环境的地方复跑）：
+  - run10
+```
+
+## 回归怎么跑
+
+`bash regress.sh`（在探针目录）：
+- **退出码为准**（`ProbeKit.summary()` 的 0/1）
+- **grep 兜底**（给还没迁到 ProbeKit 的探针）
+- 两个信号任一报警就算不过 —— 宁可多报，不可漏报
+
+判定关键词**只放在明确表示失败的短语上**（`失败 ✗` / `前提不成立` / `编译失败`）。
+别用 `Exception` / `错误` 这种词：探针会**刻意制造异常并如实打印**
+（「坏 SVG 抛了 WFCException」），那是**说明**不是**失败** —— 这个误判踩过。
+
 ## 字节码复核（不能跑探针时）
 
 只有「接线是否真的接上」这类问题，可以用字节码复核兜底：
@@ -90,6 +221,69 @@ for n in z.namelist():
     if n.endswith('.class') and '要找的字符串'.encode() in z.read(n):
         print(n)
 ```
+
+## ★ Agent 级行为回归（单元探针覆盖不到的那一层）
+
+**26 个探针原来全是单元级** —— 测函数、测布局、测解析。
+但历史上最贵的 bug 一条都不在那儿，全在 Agent 循环里：
+
+| 出过的事故 | 在哪一层 |
+|---|---|
+| steer 的追加输入模型没看到 | Agent 循环 |
+| 点「停止」要等 2 分钟 | Agent 循环（MCP 分片等待） |
+| 工具报错整轮崩掉 | Agent 循环（错误恢复） |
+| 一句话渲染成好几个气泡 | 历史 → 界面 |
+
+**做法**（借自 insight-agents 的 `evals/fault_inject/`）：
+
+1. `AgentRunner.run()` 加 `providerOverride: LlmProvider? = null`
+   —— 默认 null，行为**逐字节不变**（mavis 的 "Off by default" 原则）
+2. `ScriptedProvider`：脚本化假模型。
+   `Turn.textOf("...")` / `toolOf(name, args)` / `errorOf(msg)` / `slowOf(ms, text)`
+   - `errorOf` **真的抛异常**（不是回一个优雅的错误码）—— 真实世界的断网就是抛异常
+   - `slowOf` 期间检查 cancelFlag —— 这样才测得出取消够不够快
+   - `Exhausted.FAIL`（默认）：脚本用完还被请求 → **说明循环多跑了一轮，要响亮地失败**
+3. `AgentLoopProbe`：8 个场景驱动真实循环（工具编排 / 工具失败后继续 /
+   模型抛异常 / 取消立刻生效 / steer 注入 / 脚本用完 / usage 累加 / 流式拼接）
+
+**Java 调 Kotlin 的两个坑**：
+- Kotlin 的 vararg + 默认参数在 Java 里调不动 → 给 `Turn` 加一组
+  `@JvmStatic` 的不带默认参数工厂（`textOf` / `toolOf` / `errorOf` / `slowOf`）
+- `AgentRunner.run` 的参数是 `Function0` / `Function1`，Java 里要写
+  `kotlin.jvm.functions.Function0<List<String>>`
+- **依赖是 final 类时换个思路**：`McpManager` 既不能继承也不能代理，
+  与其硬造假对象，不如把参数改成**可空**（「没有 MCP 的运行器」本身就是合理状态）
+
+**探针抓出来的两个真 bug**：
+1. `AgentRunner` 对 `provider.streamChat` **没有 try/catch 兜底** ——
+   现有 provider 各自内部 catch 了，但那是实现细节不是接口契约，
+   漏一处就直接冒到界面。已补兜底（取消导致的异常不算错误）。
+2. 探针自己的 `onError(String, Throwable)` 写成了**重载**而不是覆写 ——
+   接口里只有一个参数。表现是两个场景都误报「没有报错」。
+   **写监听器实现时先看清楚接口签名**，多一个参数编译器不会拦你。
+
+## ★ 沙箱逃逸回归集
+
+借自 insight-agents 的 `evals/golden/sandbox_security.yaml`（6 类逃逸）。
+`SandboxEscapeProbe` 覆盖 22 条，分三组：
+
+- **必须被拒**：`..` 上跳、绝对路径系统目录（大小写）、
+  **同前缀的兄弟目录**（`/proj` vs `/proj-evil`）、父目录本身
+- **必须放行**：项目内相对/绝对/新文件/`./a/../` 归一化/项目根
+- **不能过严**：项目内叫 `WindowsBackup`、`etc` 的目录**不能**被误挡
+  （过严和安全一样是 bug）；空路径拒绝、引号包裹的合法路径放行
+- **软链接绕过**：项目内 `link -> C:/Windows`，写 `link/System32/...`
+
+**抓出来的真 bug**：黑名单**在 Windows 上是死代码**。
+常量和比较串的分隔符不一致 ——
+`blockedPrefixes` 写的是 `"c:\\windows"`（Kotlin 字面量带反斜杠），
+而比较前已把路径统一成 `/`，**永远匹配不上**。Linux 的 `/etc` 没反斜杠所以没事。
+后果：用户一切到「全盘沙盒」，系统目录就完全没保护。
+修法：常量统一写 `/`，并且**按路径段匹配**（`==` 或 `prefix + "/"`）而不是裸前缀 ——
+后者会把 `WindowsBackup` 一起拒掉。
+
+**通用规则**：内置的黑名单/白名单常量，写完要**真跑一次打招呼的用例**；
+这类「字符串比较」的错误编译器一个都不会拦。
 
 ## 发布 / 分享前的泄漏检查（**用真实值验，别只靠正则**）
 
@@ -120,3 +314,7 @@ for n in z.namelist():
 2. `md5sum` 核对装进插件目录的 jar 确实是新构建的
 3. 更新工程日志 `.workbuddy/memory/YYYY-MM-DD.md`
 4. 把新踩的坑写进技能（就是这些文件）
+
+---
+
+<!-- gaps: ["真机交互类验证（点击、滚动、悬停）还没找到自动化办法", "多线程竞态只覆盖了取消路径", "LLM 真实输出的质量无法离线评判（只能靠 golden case + 真机）"] -->

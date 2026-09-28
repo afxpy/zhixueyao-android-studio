@@ -15,6 +15,7 @@ import com.intellij.util.ui.JBUI
 import com.zhixueyao.agent.AgentPresets
 import com.zhixueyao.agent.ContextCompactor
 import com.zhixueyao.agent.AgentRunner
+import com.zhixueyao.agent.Skills
 import com.zhixueyao.agent.AgentUiBridge
 import com.zhixueyao.agent.ApprovalDecision
 import com.zhixueyao.agent.ApprovalRequest
@@ -98,6 +99,22 @@ class ChatPanel(private val project: Project) : JBPanel<ChatPanel>(BorderLayout(
 
         /** 气泡宽度下限：窗口很窄时不再按比例缩，否则会挤成一条 */
         const val MIN_BUBBLE_WIDTH = 200
+
+        /**
+         * 附件胶囊里缩略图的边长。
+         *
+         * 18 是权衡值：再小就看不出是张什么图，再大一个胶囊就要 160px+、
+         * 一行放不下几个（用户要的是「能一次挂好几张」）。
+         */
+        const val THUMB_PX = 18
+
+        /**
+         * 附件名最多显示几个字，超出用 … 截断（完整名在 tooltip 里）。
+         *
+         * 必须截断：文件名一长，**一个胶囊就能占满整行**，
+         * 后面的附件被挤到看不见（用户报过这个）。
+         */
+        const val ATTACH_NAME_MAX = 14
 
         /** 输入区两张卡片的标识：正常输入 / 需要用户拍板 */
         const val CARD_INPUT = "input"
@@ -554,7 +571,15 @@ class ChatPanel(private val project: Project) : JBPanel<ChatPanel>(BorderLayout(
      * ② 覆写 getMaximumSize 限制高度。不限制的话 BoxLayout 会把多余纵向空间
      *    全分给它（最大高度是 32767），任务清单和产物面板会被压成一条缝。
      */
-    private val attachmentBar = object : JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.LEFT, 6, 4)) {
+    /**
+     * 附件条。
+     *
+     * 布局必须用 [WrapLayout] 而**不是**标准 FlowLayout —— 原因见那个类的注释：
+     * 标准 FlowLayout 按「自己的当前宽度」算高度，首次布局时宽度还是 0，
+     * 于是按单行算高度；外面 BoxLayout 又按这个高度分配，
+     * **换行到第二排的芯片直接被裁掉**（用户报的「多张图只看到第一张」）。
+     */
+    private val attachmentBar = object : JBPanel<JBPanel<*>>(WrapLayout(hgap = 6, vgap = 4)) {
         init {
             isVisible = false
             isOpaque = false
@@ -1977,88 +2002,152 @@ class ChatPanel(private val project: Project) : JBPanel<ChatPanel>(BorderLayout(
      * 图片缩略图**可点开看大图** —— 粘贴截图时尤其需要，
      * 24px 的方块根本认不出是哪张。
      */
+    /**
+     * 附件条：**紧凑胶囊** + 悬停看大图。
+     *
+     * ## 为什么推倒重写
+     *
+     * 用户反馈（对着 WorkBuddy 的输入框比的）：
+     * 「粘贴在输入框的图片会压缩成一个小图标+文字（一个椭圆形括起来的），
+     * 鼠标移到这个图片上还能显示出图片，移除则不显示」；
+     * 「上传的图片是不是占地太大了？这个框让我无法上传多个图片文件等」。
+     *
+     * 旧版有三个毛病：
+     *  1. 芯片里塞了「缩略图 + 完整文件名 + 类型说明（图片 / N 字符）+ 关闭」四段，
+     *     文件名一长就**一个芯片占满整行** —— 多张图根本排不下；
+     *  2.  +  +  这个组合是**假圆角**：
+     *     实底还是矩形，只有描边是圆的（本工程记过这条坑）；
+     *  3. 想知道「这张图是什么」只能点开大图，鼠标划过看不到。
+     *
+     * 现在：**18px 缩略图 + 截断的文件名 + 关闭**，圆角自绘；
+     * 类型说明挪进 tooltip，鼠标悬停直接浮出大图（见 [ImageHoverPreview]）。
+     */
     private fun refreshAttachmentBar() {
         attachmentBar.removeAll()
         for (att in attachments.toList()) {
-            val chip = JBPanel<JBPanel<*>>(BorderLayout(6, 0)).apply {
-                isOpaque = true
-                background = UiKit.card
-                border = UiKit.cardBorder(UiKit.border, UiKit.radiusSmall)
-            }
-
-            val preview = att.processed.preview
-            val thumb: java.awt.Image? = when {
-                preview != null -> AttachmentSupport.thumbnailOf(preview, 26).image
-                att.processed.isImage && att.path != null ->
-                    AttachmentSupport.thumbnail(att.path, 26)?.image
-                else -> null
-            }
-
-            val icon: JLabel = if (thumb != null) {
-                JLabel(javax.swing.ImageIcon(thumb)).apply {
-                    // 点缩略图弹出大图。用原始 path 或内存里的预览图，
-                    // 两者都没有（读取失败）时不做响应
-                    cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-                    toolTipText = "点击查看大图"
-                    border = JBUI.Borders.emptyLeft(6)
-                    addMouseListener(object : MouseAdapter() {
-                        override fun mouseClicked(e: MouseEvent) {
-                            showImagePreview(att)
-                        }
-                    })
-                }
-            } else {
-                JLabel(if (att.processed.isImage) AllIcons.FileTypes.Image else AllIcons.FileTypes.Text).apply {
-                    border = JBUI.Borders.emptyLeft(6)
-                }
-            }
-            chip.add(icon, BorderLayout.WEST)
-
-            val meta = attachmentMeta(att)
-            val nameLabel = JBLabel(att.displayName).apply {
-                font = font.deriveFont(font.size - 1f)
-                foreground = UiKit.text
-                toolTipText = "${att.path?.toString() ?: att.displayName}\n$meta" +
-                    if (att.processed.rawText != null) "\n点击查看内容" else ""
-                // 文本附件可点开看内容 —— 长文件发出去之前总得能确认一下发的是什么。
-                // 这也正是「上传内容超长要折叠」的落点：内容弹窗里默认折叠，
-                // 而不是把几千行塞进附件条。
-                if (att.processed.rawText != null) {
-                    cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-                    addMouseListener(object : MouseAdapter() {
-                        override fun mouseClicked(e: MouseEvent) {
-                            showTextPreview(att)
-                        }
-                    })
-                }
-            }
-            chip.add(nameLabel, BorderLayout.CENTER)
-
-            val metaLabel = JBLabel(meta).apply {
-                font = font.deriveFont(font.size - 1.5f)
-                foreground = UiKit.faint
-            }
-
-            val removeBtn = UiKit.iconButton(AllIcons.General.InlineClose, "移除", pad = 2) {
-                attachments.remove(att)
-                refreshAttachmentBar()
-            }
-
-            // 右侧：尺寸/字符数 + 移除按钮
-            val right = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
-                isOpaque = false
-                add(metaLabel)
-                add(removeBtn)
-            }
-            chip.add(right, BorderLayout.EAST)
-
-            attachmentBar.add(chip)
+            attachmentBar.add(buildAttachmentCapsule(att))
         }
         attachmentBar.isVisible = attachments.isNotEmpty()
         attachmentBar.revalidate()
         attachmentBar.repaint()
         refreshSendState()
     }
+
+    /**
+     * 一个附件胶囊。
+     *
+     * 圆角底是**自绘**的：`isOpaque = false` + 在 `paintComponent` 里画圆角实底。
+     * 只设 `background` + 圆角描边的话，实底仍是矩形，四角会露出直角（本工程的老坑）。
+     */
+    private fun buildAttachmentCapsule(att: PendingAttachment): JComponent {
+        val preview = att.processed.preview
+        val thumb: java.awt.Image? = when {
+            preview != null -> AttachmentSupport.thumbnailOf(preview, THUMB_PX).image
+            att.processed.isImage && att.path != null -> AttachmentSupport.thumbnail(att.path, THUMB_PX)?.image
+            else -> null
+        }
+        val meta = attachmentMeta(att)
+        val fullName = att.displayName
+        val fullTip = buildString {
+            append(att.path?.toString() ?: fullName)
+            append('\n').append(meta)
+            when {
+                att.processed.isImage -> append("\n悬停看大图，单击打开")
+                att.processed.rawText != null -> append("\n单击查看内容")
+            }
+        }
+
+        val capsule = object : JBPanel<JBPanel<*>>(BorderLayout(5, 0)) {
+            private var hovered = false
+
+            init {
+                isOpaque = false            // 必须：交给 paintComponent 画圆角实底
+                toolTipText = fullTip
+                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                border = JBUI.Borders.empty(3, 7, 3, 3)
+                addMouseListener(object : MouseAdapter() {
+                    override fun mouseEntered(e: MouseEvent) {
+                        hovered = true; repaint()
+                        // 有图才浮预览；文本附件悬停弹大图没意义。
+                        // 锚点用 `e.component`（就是这个胶囊自己）—— 匿名对象里没有
+                        // 可用的 `this@` 标签，而事件本来就带着它
+                        thumb?.let { ImageHoverPreview.schedule(e.component, it, att) }
+                    }
+
+                    override fun mouseExited(e: MouseEvent) {
+                        hovered = false; repaint()
+                        ImageHoverPreview.hide()
+                    }
+
+                    override fun mouseClicked(e: MouseEvent) {
+                        ImageHoverPreview.hide()
+                        when {
+                            att.processed.isImage -> showImagePreview(att)
+                            att.processed.rawText != null -> showTextPreview(att)
+                        }
+                    }
+                })
+            }
+
+            override fun paintComponent(g: Graphics) {
+                val g2 = g.create() as java.awt.Graphics2D
+                try {
+                    g2.setRenderingHint(
+                        java.awt.RenderingHints.KEY_ANTIALIASING,
+                        java.awt.RenderingHints.VALUE_ANTIALIAS_ON
+                    )
+                    // 胶囊 = 高度一半的圆角
+                    val r = height
+                    g2.color = if (hovered) UiKit.hover else UiKit.card
+                    g2.fillRoundRect(0, 0, width - 1, height - 1, r, r)
+                    g2.color = UiKit.border
+                    g2.drawRoundRect(0, 0, width - 1, height - 1, r, r)
+                } finally {
+                    g2.dispose()
+                }
+                super.paintComponent(g)
+            }
+
+            override fun getMaximumSize(): Dimension = preferredSize
+        }
+
+        // 左：缩略图（没有就退回文件类型图标）
+        capsule.add(
+            if (thumb != null) {
+                JLabel(javax.swing.ImageIcon(thumb)).apply { preferredSize = Dimension(THUMB_PX, THUMB_PX) }
+            } else {
+                JLabel(if (att.processed.isImage) AllIcons.FileTypes.Image else AllIcons.FileTypes.Text)
+            },
+            BorderLayout.WEST
+        )
+
+        // 中：截断的文件名
+        capsule.add(
+            JBLabel(ellipsize(fullName, ATTACH_NAME_MAX)).apply {
+                font = font.deriveFont(font.size - 1f)
+                foreground = UiKit.text
+            },
+            BorderLayout.CENTER
+        )
+
+        // 右：移除
+        capsule.add(
+            UiKit.iconButton(AllIcons.General.InlineClose, "移除", pad = 1) {
+                ImageHoverPreview.hide()
+                attachments.remove(att)
+                refreshAttachmentBar()
+            }.apply {
+                // 移除按钮自己也要参与尺寸计算，否则胶囊宽度算不准
+                preferredSize = Dimension(16, 16)
+            },
+            BorderLayout.EAST
+        )
+        return capsule
+    }
+
+    /** 超长文件名截断：中文按「字」数，末尾加省略号（完整名在 tooltip 里） */
+    private fun ellipsize(text: String, max: Int): String =
+        if (text.length <= max) text else text.take(max) + "…"
 
     /** 附件芯片右侧的元信息：图片给尺寸，文本给字符数，其他给类型说明。 */
     private fun attachmentMeta(att: PendingAttachment): String {
@@ -2346,8 +2435,23 @@ class ChatPanel(private val project: Project) : JBPanel<ChatPanel>(BorderLayout(
             if (settings.enableMcp) mcpManager.allInstructions() else emptyList()
         // 把本会话的临时产物目录写进提示词 —— 不写的话模型会把试验产物丢进用户工程
         val workspace = runCatching { sessionWorkspace()?.absolutePath ?: "" }.getOrDefault("")
+        // 拿**用户最新那句话**去匹配技能触发词，命中就在提示词里给一条强指令。
+        //
+        // 为什么要主动匹配：技能目录是每轮都带的固定开销，但「该不该加载某个技能」
+        // 原来全靠模型自己从「名字 + 描述」里猜 —— 猜漏了就等于白写。
+        // 主动匹配把这一步变成确定性的对照检查（借鉴 agents-universe 的做法）。
+        val triggerHint = runCatching {
+            val lastUser = history.lastOrNull { it.role == ChatMessage.Role.USER }?.content.orEmpty()
+            Skills.renderTriggerHint(Skills.matchTriggers(project, lastUser))
+        }.getOrDefault("")
         val prompt = ToolRegistry.systemPrompt(
-            project.name, settings.agentPreset, mcpInstructions, workspace
+            projectName = project.name,
+            presetId = settings.agentPreset,
+            // 显式传 project：不然技能库只能列全局的，项目技能看不见
+            project = project,
+            mcpInstructions = mcpInstructions,
+            workspacePath = workspace,
+            triggerHint = triggerHint
         )
         if (history.isEmpty() || history.first().role != ChatMessage.Role.SYSTEM) {
             history.add(0, ChatMessage.system(prompt))

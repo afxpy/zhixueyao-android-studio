@@ -1,6 +1,7 @@
 ---
 name: zhixueyao-swing-ui
 description: 这个工程里 Swing 界面反复踩的坑：圆角卡片、BoxLayout 对齐、caret 拽滚动、流式节流、Timer 泄漏、静默失败。改 ui/ 下任何文件前必读。
+triggers: 界面, 输入框, 附件, 气泡, 按钮, 布局, 表格, 预览窗口
 ---
 
 # 止血药 · Swing 界面避坑清单
@@ -208,6 +209,34 @@ val file = File(relPath).let { if (it.isAbsolute) it else File(base, relPath) }
 `JEditorPane` 默认**不处理链接**，点了毫无反应。挂一个 `HyperlinkListener`：
 本地图片/视频 → 开预览；其余 → 交给 IDE 打开。
 链接可能写成 `file:///C:/x.svg`、`C:/x.svg`、或工程相对路径 —— 三种都要认。
+
+## 16. 标准 `FlowLayout` 算不准折行高度 —— 多出来的内容会被**裁掉**
+
+用户报的现象：「上传多张图片或者文件会被挤压成第一次上传的图片或者文件，其他上传的看不到」。
+看着像上传失败，其实是**布局把第二排裁了**。
+
+`FlowLayout.preferredLayoutSize` 折行时用的是 `target.getWidth()`，
+而首次布局时这个宽度**还是 0** → 它按「全部排成一行」算高度。
+外面套 `BoxLayout` 时更致命：`BoxLayout` 严格按子组件的 `maximumSize.height` 分配，
+而那个值通常就是 `preferredSize.height`（单行）—— **换行到第二排的组件全在可视区外**。
+
+**探针实测**（680px 容器、150x26 的芯片）：
+
+| 张数 | 标准 FlowLayout | WrapLayout |
+|---|---|---|
+| 1 | 34px | 34px |
+| 8 | **34px**（需要 2 行） | 68px（2 行） |
+| 12 | **34px**（需要 3 行） | 102px（3 行） |
+
+1 个和 12 个高度完全一样 —— 这就是「其他看不到」的根因。
+
+修法：用 `com.zhixueyao.ui.WrapLayout`，它**优先拿父容器的宽度**折行
+（父宽在布局早期就已知，不存在「等自己被布局」的循环依赖），
+拿不到才退回自己的宽度，最后用保守兜底值。
+**宁可多折几行（看着松一点），也不要少算一行（内容直接消失）。**
+
+**通用规则**：任何「会折行的容器」放进 BoxLayout / BorderLayout.NORTH 之前，
+先确认它的 `preferredSize.height` 在**宽度未知时**也不会低估。
 
 ## 相关探针
 

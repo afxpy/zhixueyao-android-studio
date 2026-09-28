@@ -32,13 +32,23 @@ object AgentPresets {
     private val READ_ONLY = setOf(
         "read_file", "list_directory", "glob_files",
         "search_code", "find_symbol", "get_editor_context",
-        "get_diagnostics", "project_structure"
+        "get_diagnostics", "project_structure",
+        // web_fetch 只读网络、不碰工程 —— 研究模式正需要它查资料
+        "web_fetch",
+        // git 放这里：它**绝大多数用途是看历史**（这在研究模式里价值很高），
+        // 而写动作（commit/add/stash）由 GitTool 自己在运行期再挡一道
+        // （见 GitTool.execute 里的 readOnlyOnly 检查）。
+        // 只靠这份名单挡的话，要么研究模式看不了历史，要么能被提交 —— 两头不讨好。
+        "git"
     )
 
     /** 写类工具 */
     private val WRITE = setOf(
         "write_file", "edit_file", "delete_file", "restore_file",
-        "generate_svg", "export_drawable", "save_asset"
+        "generate_svg", "export_drawable", "save_asset",
+        // run_script 是**任意代码**：它能读也能改文件，
+        // 所以按「写」归类（研究模式下不该能跑脚本）
+        "run_script"
     )
 
     /** 执行类工具 */
@@ -51,7 +61,7 @@ object AgentPresets {
      * 「列个任务清单」「让我选一下」这些**不改动任何东西**的能力在只读模式下就没了 ——
      * 而它们恰恰是只读研究最需要的（研究任务往往步骤多、岔路多）。
      */
-    private val INTERACTION = setOf("todo_write", "ask_user", "skill")
+    private val INTERACTION = setOf("todo_write", "ask_user", "skill", "memory")
 
     val all: List<Preset> = listOf(
         Preset(

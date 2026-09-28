@@ -38,7 +38,9 @@ class InstallSkillTool : AgentTool {
             "跨项目通用的方法论 → global（默认）。" +
             "同一份经验只会越攒越准 —— 发现已有同名技能时用 action=install + overwrite=true 更新它，" +
             "不要另起一个新名字（否则技能库会越长越乱）。" +
-            "frontmatter 由本工具自动生成，你只需要给 name / description / body。"
+            "frontmatter 由本工具自动生成 —— 你给 name / description / body，" +
+            "另外建议填 triggers（让它在对的时候被自动想起来）；" +
+            "如果是「一串流程」，用 steps 列出它由哪几个技能组成。"
 
     override val parameters: Json.Obj = jsonObj(
         "type" to "object".toJson(),
@@ -74,6 +76,18 @@ class InstallSkillTool : AgentTool {
                 "type" to "boolean".toJson(),
                 "description" to "已存在同名技能时必须显式传 true 才覆盖 —— 防止手滑把别人写好的技能冲掉。" +
                     "更新自己之前装的技能就传 true"
+            ),
+            "triggers" to jsonObj(
+                "type" to "string".toJson(),
+                "description" to "触发短语，逗号分隔（2-5 条）。**强烈建议填**：" +
+                    "用户说出这些词时，这个技能会被自动匹配到并提示你加载。" +
+                    "写「用户可能的不同说法」而不是把技能名换个说法；" +
+                    "**别写单字**（「改」「图」这种会误命中每一句话）"
+            ),
+            "steps" to jsonObj(
+                "type" to "string".toJson(),
+                "description" to "复合技能用：这个流程由哪几个技能按顺序组成（逗号分隔的技能名）。" +
+                    "比如「发布流程」= 「构建, 泄漏检查, 打包」。普通技能不要填"
             )
         ),
         "required" to jsonArr("name".toJson())
@@ -122,6 +136,26 @@ class InstallSkillTool : AgentTool {
                     append("---\n")
                     append("name: ").append(name).append('\n')
                     append("description: ").append(desc.replace("\n", " ")).append('\n')
+                    // 触发短语**必须能写进来**。
+                    //
+                    // 之前只有解析没有写入 —— 能读不能写，等于这个字段
+                    // 只能靠用户手工编辑 SKILL.md 才有。而自动匹配恰恰是它的价值所在：
+                    // 模型自己攒的技能，应该自己顺手把触发词填上，
+                    // 不然后面永远匹配不到（写了等于白写）。
+                    val trig = args.str("triggers")?.trim().orEmpty()
+                    if (trig.isNotEmpty()) {
+                        append("triggers: ")
+                        append(trig.split(',', '，').map { it.trim() }
+                            .filter { it.isNotEmpty() }.take(6).joinToString(", "))
+                        append('\n')
+                    }
+                    val stepsArg = args.str("steps")?.trim().orEmpty()
+                    if (stepsArg.isNotEmpty()) {
+                        append("steps: ")
+                        append(stepsArg.split(',', '，').map { it.trim() }
+                            .filter { it.isNotEmpty() }.take(12).joinToString(", "))
+                        append('\n')
+                    }
                     append("---\n\n")
                     append(body).append('\n')
                 }
@@ -150,6 +184,17 @@ class InstallSkillTool : AgentTool {
                     append(if (useProject) "项目技能库" else "全局技能库")
                     append("：").append(dir.path).append('\n')
                     if (extras.isNotEmpty()) append("附属文件：").append(extras.joinToString("、")).append('\n')
+                    val trigWritten = args.str("triggers")?.trim().orEmpty()
+                    if (trigWritten.isNotEmpty()) {
+                        append("触发词：").append(trigWritten).append('\n')
+                        append("（用户说到这些词时它会被自动匹配到并提示加载）\n")
+                    } else {
+                        // 没写触发词时提醒一句 —— 这一条最容易被漏，而漏了就等于没用
+                        append("⚠️ 没填 triggers：这个技能只能靠你自己想起来用它。")
+                        append("下次更新时建议补上（逗号分隔，2-5 条）。\n")
+                    }
+                    val stepsWritten = args.str("steps")?.trim().orEmpty()
+                    if (stepsWritten.isNotEmpty()) append("流程步骤：").append(stepsWritten).append('\n')
                     append("下一条消息起它就会出现在系统提示词的「可用技能」清单里。")
                 }
             )

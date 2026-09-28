@@ -35,7 +35,44 @@ object Skills {
         val description: String,
         val body: String,
         val dir: File,
-        val source: String
+        val source: String,
+        /**
+         * 触发短语：用户说出这类话时，这个技能大概率用得上。
+         *
+         * 借鉴自参考项目 agents-universe 的 skill 设计（它 frontmatter 里有 `triggers`）。
+         * 为什么有用：目录里原来只有「名字 + 描述」，模型得靠**猜**该不该加载 ——
+         * 有了触发短语，匹配从「语义猜测」变成「对照检查」，命中率明显不一样。
+         *
+         * 写在 frontmatter 里，逗号分隔：`triggers: 输入框, 粘贴图片, 附件`
+         */
+        val triggers: List<String> = emptyList(),
+        /**
+         * 技能自己标注的**待补缺口**（正文里写 `<!-- gaps: ["缺 X", "Y 没写"] -->`）。
+         *
+         * 同样是 agents-universe 的做法。价值在于：技能是**攒出来的**，
+         * 第一版总有不全的地方；把「哪里还没写」显式标出来，
+         * 模型下次更新它时就知道该补什么，而不是重写一遍或干脆不管。
+         */
+        val gaps: List<String> = emptyList(),
+        /**
+         * 正文里 `[[别的技能名]]` 形式的交叉引用。
+         *
+         * 借自参考项目 agents-universe（它用 `[[slug]]` 连接知识文件，
+         * 还把「连接密度」当成完整度评分的一项）。
+         * 我们取它最有价值的那个用法：**死链检测** ——
+         * 引用了不存在的技能，说明要么名字写错、要么那个技能还没写，
+         * 两种都该被发现而不是悄悄烂在那儿。
+         */
+        val crossLinks: List<String> = emptyList(),
+        /**
+         * 复合技能的构成步骤（frontmatter 里的 `steps: A, B`）。
+         *
+         * agents-universe 把技能分四型（guidance / template / executable / composite），
+         * 其中 composite 是「技能编排技能」。我们取**轻量版**：
+         * 不自动展开（展开会把上下文撑爆），只在加载时提示
+         * 「这是个流程，按顺序去加载这几步」。
+         */
+        val steps: List<String> = emptyList()
     ) {
         /** 技能目录下的附属文件（相对路径），供模型判断要不要去读 */
         fun assets(): List<String> {
@@ -49,6 +86,12 @@ object Skills {
     }
 
     const val SKILL_FILE = "SKILL.md"
+
+    /** 正文里的缺口标注：gaps 注释 */
+    private val GAPS_RE = Regex("""<!--\s*gaps\s*:\s*\[(.*?)]\s*-->""", RegexOption.DOT_MATCHES_ALL)
+
+    /** 交叉引用：`[[技能名]]` */
+    private val CROSS_LINK_RE = Regex("""\[\[([^\[\]\n]{1,60})]]""")
 
     /** 提示词里最多列多少个技能（每个约 200 字，见 [catalogForPrompt]） */
     const val MAX_CATALOG = 60
@@ -121,6 +164,100 @@ object Skills {
         return found.values.sortedBy { it.name }.also { cache = it }
     }
 
+    /**
+     * 用用户这句话去匹配技能的触发词，返回命中的技能。
+     *
+     * ## 为什么要有它
+     *
+     * 之前 `triggers` 只是**列在目录里**，等模型自己判断该不该加载 —— 那是被动的。
+     * 参考项目 agents-universe 的做法是**每轮拿用户消息主动匹配**，
+     * 命中的技能正文直接注入提示词（`matching_triggers(user_message)[:3]`）。
+     *
+     * 这里取它的**思路**但不注入正文（正文太贵）：命中后只在提示词里给一条强指令，
+     * 让模型「先加载再动手」。信号从「列表里的一个词」变成「明确的一句话」，
+     * 成本只有几十个 token。
+     *
+     * ## 三条护栏（都是他们踩出来的坑，照抄）
+     *
+     * 1. **触发词不能为空**。`"" in text` 恒为 true —— 一个 `triggers: [""]`
+     *    的手误会让这个技能**命中每一句话**。
+     * 2. **单字触发词直接丢弃**。中文里「图」「改」这种单字几乎必误命中
+     *    （用户说「改一下」就命中了「改」）。
+     * 3. **限量**。触发词写得宽时可能同时命中好几个，全注入就把提示词挤爆了。
+     *
+     * @return 命中的技能 + 各自命中的词，按「命中词数量」降序（命中的越多越相关）
+     */
+    fun matchTriggers(
+        project: Project?,
+        text: String,
+        limit: Int = 3
+    ): List<TriggerHit> {
+        if (text.isBlank()) return emptyList()
+
+        // 显式出口：`/技能名` 强制加载。
+        //
+        // 触发词是「猜用户想干什么」，猜错很正常；用户明确要点某个技能时必须能点到。
+        // 借鉴自 agents-universe 的 `/slug` 命令（它的最高优先级分支）。
+        val trimmed = text.trimStart()
+        if (trimmed.startsWith("/")) {
+            val cmd = trimmed.substring(1).split(' ', '\n', '\t').firstOrNull()?.trim().orEmpty()
+            if (cmd.isNotEmpty()) {
+                byName(project, cmd)?.let { return listOf(TriggerHit(it, listOf("/$cmd"))) }
+                // 命令写了但没这个技能：也返回一个「命中」，让提示词里能说清
+                // 「你写的这个技能不存在，现有的是这些」—— 比静默不命中好
+                return listOf(TriggerHit(MISSING, listOf("/$cmd")))
+            }
+        }
+
+        val lower = text.lowercase()
+        val hits = mutableListOf<TriggerHit>()
+        for (skill in all(project)) {
+            if (skill.triggers.isEmpty()) continue
+            val matched = skill.triggers.filter { t ->
+                // 护栏 1 + 2：非空、且至少两个字
+                t.isNotBlank() && t.length >= 2 && t.lowercase() in lower
+            }
+            if (matched.isNotEmpty()) hits.add(TriggerHit(skill, matched))
+        }
+        return hits.sortedByDescending { it.matched.size }.take(limit)
+    }
+
+    /**
+     * 哨兵：用户用 `/xxx` 点名了一个**不存在**的技能。
+     *
+     * 用哨兵而不是 null，是因为调用方需要区别「没命中」和「点名点错了」——
+     * 后者必须说出来（用户以为有这个技能，不说他会一直试）。
+     */
+    val MISSING = Skill("", "", "", File("."), "缺失")
+
+    /** 一次触发词命中：哪个技能、命中了哪几个词 */
+    data class TriggerHit(val skill: Skill, val matched: List<String>)
+
+    /** 这次命中是不是「点名不存在」 */
+    fun isMissingPointed(hit: TriggerHit): Boolean = hit.skill === MISSING
+
+    /** 把命中结果渲染成提示词里的一段指令；没有命中就返回空串（不占 token） */
+    fun renderTriggerHint(hits: List<TriggerHit>): String {
+        if (hits.isEmpty()) return ""
+        return buildString {
+            append("## 这条消息命中了这些技能（**动手前先加载**）\n\n")
+            hits.forEach { h ->
+                if (isMissingPointed(h)) {
+                    // 点名点错了要说清楚，否则用户会一直以为技能在但没生效
+                    append("- ⚠️ 你点了 `").append(h.matched.joinToString("、"))
+                    append("`，但技能库里**没有**这个技能。")
+                    append("先用 `install_skill` 的 `action=list` 看看现有哪些。\n")
+                } else {
+                    append("- `").append(h.skill.name).append("`")
+                    append("　命中：").append(h.matched.joinToString("、"))
+                    append("\n")
+                }
+            }
+            append("\n用 `skill` 工具把它们的正文取回来再动手 —— ")
+            append("这些技能里写的就是「这个项目上已经踩过的坑」，照着做能少走弯路。\n")
+        }
+    }
+
     fun byName(project: Project?, name: String): Skill? =
         all(project).firstOrNull { it.name.equals(name, ignoreCase = true) }
 
@@ -132,9 +269,51 @@ object Skills {
             val (meta, body) = splitFrontMatter(text)
             val name = meta["name"]?.takeIf { it.isNotBlank() } ?: dir.name
             val desc = meta["description"]?.takeIf { it.isNotBlank() } ?: "（无说明）"
-            Skill(name, desc, body.trim(), dir, source)
+            val triggers = meta["triggers"]
+                ?.split(',', '，')
+                ?.map { it.trim() }
+                ?.filter { it.isNotEmpty() }
+                ?.take(6)
+                ?: emptyList()
+            val trimmed = body.trim()
+            Skill(
+                name = name,
+                description = desc,
+                body = trimmed,
+                dir = dir,
+                source = source,
+                triggers = triggers,
+                gaps = parseGaps(body),
+                crossLinks = parseCrossLinks(trimmed),
+                steps = meta["steps"]?.split(',', '，', ' ')
+                    ?.map { it.trim() }?.filter { it.isNotEmpty() }?.take(12) ?: emptyList()
+            )
         }.onFailure { log.warn("技能解析失败：${dir.path}", it) }.getOrNull()
     }
+
+    /**
+     * 解析正文里的缺口标注。
+     *
+     * 用 HTML 注释而不是新 frontmatter 字段：它描述的是**正文缺什么**，
+     * 属于正文的一部分；而且注释渲染时天然不可见，不干扰阅读。
+     */
+    private fun parseGaps(body: String): List<String> {
+        val m = GAPS_RE.find(body) ?: return emptyList()
+        return m.groupValues[1]
+            .split(',')
+            .map { it.trim().trim('"', '\'', ' ') }
+            .filter { it.isNotEmpty() }
+            .take(8)
+    }
+
+    /** 正文里的 `[[技能名]]` 交叉引用 */
+    private fun parseCrossLinks(body: String): List<String> =
+        CROSS_LINK_RE.findAll(body)
+            .map { it.groupValues[1].trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .take(20)
+            .toList()
 
     /** 切出 `---` 包裹的 YAML frontmatter（只认 name/description 这类简单键值） */
     private fun splitFrontMatter(text: String): Pair<Map<String, String>, String> {
@@ -189,6 +368,17 @@ object Skills {
                 // 描述也从 200 字压到 110 字：够判断「这个技能是不是我要的」就停。
                 append("- **").append(s.name).append("**：")
                 append(s.description.replace("\n", " ").take(110))
+                // 触发短语：**值得这点开销** —— 它是「该不该加载」最直接的判据，
+                // 比让模型从描述里猜准得多。压到 40 字以内，避免目录膨胀。
+                if (s.triggers.isNotEmpty()) {
+                    append("　［命中就加载：")
+                    append(s.triggers.joinToString("、").take(40))
+                    append("］")
+                }
+                // 有缺口就标出来：提醒模型「用它的同时，顺手把缺的补上」
+                if (s.gaps.isNotEmpty()) {
+                    append("　（有 ").append(s.gaps.size).append(" 处待补）")
+                }
                 append("\n")
             }
         }

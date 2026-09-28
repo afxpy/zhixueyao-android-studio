@@ -56,10 +56,33 @@ interface AgentTool {
  */
 object PathGuard {
 
+    /**
+     * 系统目录黑名单 —— **任何权限档位都不放开**的那一层。
+     *
+     * 沙盒档位（仅项目内 / 全盘）管的是「项目外能不能碰」；
+     * 这个列表管的是「碰了就没救了的地方」。两者职责不同，
+     * 所以用户切到「全盘沙盒」时，这里**照样拦**。
+     *
+     * **分隔符统一写 `/`**：比较时路径会被规范成 `/` 分隔的小写串，
+     * 常量里再写 `\\` 就永远比不上了 —— 这个 bug 真的存在过：
+     * Windows 的三条常量全是死代码，切到全盘后系统目录一点保护都没有
+     * （沙箱逃逸探针 SandboxEscapeProbe 场景⑤ 抓出来的）。
+     */
     private val blockedPrefixes = listOf(
-        "c:\\windows", "c:\\program files", "c:\\program files (x86)",
+        "c:/windows", "c:/program files", "c:/program files (x86)",
         "/etc", "/usr/bin", "/bin", "/sbin", "/boot", "/sys", "/proc"
     )
+
+    /**
+     * 判断路径是否落在黑名单里。
+     *
+     * **按路径段比，不做裸前缀**：`c:/windowsbackup/x` 不是 `c:/windows` 下的东西，
+     * 裸 `startsWith` 会把它一起拒掉（过严和安全一样是 bug）。
+     * 规则：完全相等，或者前缀后紧跟分隔符。
+     */
+    private fun isBlocked(lower: String): Boolean = blockedPrefixes.any { prefix ->
+        lower == prefix || lower.startsWith("$prefix/")
+    }
 
     fun resolve(project: Project, rawPath: String, action: String = "访问"): Path {
         val cleaned = rawPath.trim().trim('"', '\'')
@@ -76,7 +99,7 @@ object PathGuard {
         }.normalize()
 
         val lower = absolute.toString().lowercase().replace('\\', '/')
-        if (blockedPrefixes.any { lower.startsWith(it) }) {
+        if (isBlocked(lower)) {
             throw IllegalArgumentException("出于安全考虑，禁止访问系统目录：$absolute")
         }
 

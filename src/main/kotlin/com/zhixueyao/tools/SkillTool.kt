@@ -59,6 +59,48 @@ class SkillTool : AgentTool {
                     append("这个技能还带了以下文件，需要时用 read_file 读（用下面的完整路径）：\n")
                     assets.forEach { append("- ").append(skill.dir.path).append("/").append(it).append("\n") }
                 }
+                // 缺口提示：技能自己标了「哪里还没写」。
+                //
+                // 借自参考项目 agents-universe 的 gaps 标注 —— 技能是**攒出来的**，
+                // 第一版总有盲区。把盲区显式带进上下文，
+                // 模型这轮做完了就顺手能补，不用等下次重新踩一遍。
+                // 复合技能：这是个流程，按顺序去加载几步。
+                //
+                // 刻意**不自动展开** —— agents-universe 是自动展开的
+                // （`steps` 里的技能会一起加载），但那样一次能把好几个技能的正文
+                // 全塞进上下文。这里只给指路：需要哪步自己去取，
+                // 用多少上下文由模型按任务判断。
+                if (skill.steps.isNotEmpty()) {
+                    append("\n\n## 这是一个流程，按顺序加载\n\n")
+                    skill.steps.forEachIndexed { i, st ->
+                        append(i + 1).append(". `").append(st).append("`\n")
+                    }
+                    append("\n每一步做完再加载下一步，不要一次全取回来。\n")
+                }
+
+                // 交叉引用 + **死链检测**
+                if (skill.crossLinks.isNotEmpty()) {
+                    val known = Skills.all(project).map { it.name }.toSet()
+                    val dead = skill.crossLinks.filter { it !in known && it != skill.name }
+                    append("\n\n## 相关技能\n\n")
+                    skill.crossLinks.forEach { link ->
+                        append("- `").append(link).append("`")
+                        if (link in dead) append("　⚠️ **这个技能不存在**（名字写错或还没写）")
+                        append("\n")
+                    }
+                    if (dead.isNotEmpty()) {
+                        append("\n上面标了「不存在」的，如果你正好知道该写什么，")
+                        append("做完顺手用 `install_skill` 把它建起来（或把引用改对）。\n")
+                    }
+                }
+
+                if (skill.gaps.isNotEmpty()) {
+                    append("\n\n## 这个技能还没写全的地方\n\n")
+                    skill.gaps.forEach { append("- ").append(it).append("\n") }
+                    append("\n**这一轮如果正好涉及上面某条，做完就把结论补进这个技能**")
+                    append("（用 `install_skill` + 同名 + `overwrite=true` 更新），")
+                    append("并把补好的那条从 gaps 注释里去掉。\n")
+                }
             }
         )
     }

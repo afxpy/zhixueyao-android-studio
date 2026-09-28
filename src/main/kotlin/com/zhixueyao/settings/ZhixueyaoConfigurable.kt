@@ -683,6 +683,111 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
             )
         )
 
+        // ---- 记忆 ----
+        //
+        // 对应参考项目 kemo-agent 的「查看与编辑记忆」。
+        // 记忆本来只是磁盘上的两个 MEMORY.md（用户得自己找路径），
+        // 摆到设置页里才叫「用户掌管的数据」—— 能看见、能删、能打开改。
+        form.section("记忆")
+        // `project` 不是这个类的字段 —— 设置页在「没有打开工程」时也要能显示，
+        // 所以就地取一次，取不到就只显示全局记忆
+        val settingsProject =
+            com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+        val memEntries = com.zhixueyao.agent.MemoryStore.all(settingsProject)
+        val projMem = com.zhixueyao.agent.MemoryStore.projectFile(settingsProject)
+        val globalMem = com.zhixueyao.agent.MemoryStore.globalFile()
+        form.wideRow(
+            JBLabel(
+                if (memEntries.isEmpty())
+                    "还没有记忆。AI 听到「以后都这样」「记住」这类话时会自己记下来，你也可以打开文件手写。"
+                else
+                    "共 ${memEntries.size} 条。下面列出最近的一些；完整内容在文件里，可以直接编辑。"
+            ).apply { foreground = UiKit.subtle; font = font.deriveFont(font.size - 1f) }
+        )
+
+        if (memEntries.isNotEmpty()) {
+            val memBody = JBPanel<JBPanel<*>>().apply {
+                layout = BoxLayout(this, BoxLayout.Y_AXIS)
+                isOpaque = false
+            }
+            // 只列最近 12 条：设置页不是编辑器，看个大概就行，细节去文件里
+            memEntries.takeLast(12).reversed().forEach { e ->
+                val row = JBPanel<JBPanel<*>>(BorderLayout()).apply {
+                    isOpaque = false
+                    border = JBUI.Borders.empty(3, 0)
+                    // 行高固定：内容长短不一，不固定的话列表会参差不齐
+                    maximumSize = Dimension(Int.MAX_VALUE, 26)
+                }
+                row.add(
+                    JBLabel(
+                        "<html><body style='width:420px'>" +
+                            (if (e.date.isNotBlank()) "<span style='color:gray'>[${e.date}]</span> " else "") +
+                            e.text.replace("<", "&lt;") + "</body></html>"
+                    ).apply { font = font.deriveFont(font.size - 1f) },
+                    BorderLayout.CENTER
+                )
+                row.add(
+                    UiKit.iconButton(AllIcons.Actions.GC, "删掉这条记忆") {
+                        val owner = if (com.zhixueyao.agent.MemoryStore.read(projMem ?: globalMem)
+                                .any { it.text == e.text }
+                        ) projMem else globalMem
+                        if (owner != null) com.zhixueyao.agent.MemoryStore.forget(owner, e.text)
+                        rootPanel?.let {
+                            Messages.showInfoMessage(
+                                it,
+                                "已删掉这条记忆。它不会再出现在提示词里。",
+                                "记忆"
+                            )
+                        }
+                        // 面板重建代价高，先提示用户重进设置页；直接刷新列表也行但会跳滚动位置
+                        refreshSkillsInfo()
+                    },
+                    BorderLayout.EAST
+                )
+                memBody.add(row)
+            }
+            val memCard = UiKit.roundedCard(pad = JBUI.insets(8, 10, 8, 10))
+            memCard.add(
+                object : JBScrollPane(memBody) {
+                    init {
+                        setBorder(JBUI.Borders.empty())
+                        horizontalScrollBarPolicy = JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
+                        isOpaque = false
+                        viewport.isOpaque = false
+                    }
+
+                    override fun getPreferredSize(): Dimension =
+                        Dimension(super.getPreferredSize().width, 200)
+
+                    override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, 200)
+                },
+                BorderLayout.CENTER
+            )
+            form.wideRow(memCard)
+        }
+
+        val memButtons = JPanel(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 0)).apply { isOpaque = false }
+        memButtons.add(UiKit.textButton("打开项目记忆", "随工程走，能提交进仓库") {
+            openFileInEditor(projMem)
+        })
+        memButtons.add(UiKit.textButton("打开全局记忆", "跨项目，跟着你走") {
+            openFileInEditor(globalMem)
+        })
+        memButtons.add(UiKit.textButton("打开记忆所在目录", "两个文件都在这里") {
+            runCatching {
+                java.awt.Desktop.getDesktop().open(
+                    (projMem?.parentFile ?: globalMem.parentFile)
+                )
+            }
+        })
+        form.wideRow(memButtons)
+        form.wideRow(
+            UiKit.hint(
+                "记忆放的是**一句话能说清的事实**（这个项目用哪个技术栈、你的偏好、某条约定）；" +
+                    "成体系的方法论请让 AI 写成技能。项目记忆会随工程提交，同事拉下来就带着同一份约定。"
+            )
+        )
+
         // ---- AI 助手行为 ----
         form.section("AI 助手行为")
         form.row(
@@ -897,7 +1002,8 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
                 isOpaque = false
                 alignmentX = java.awt.Component.LEFT_ALIGNMENT
                 border = JBUI.Borders.empty(4, 0)
-                maximumSize = Dimension(Int.MAX_VALUE, 52)
+                // 60 而不是 52：现在有两行（描述 + 元信息）
+                maximumSize = Dimension(Int.MAX_VALUE, 60)
             }
             val name = JBLabel(skill.name).apply {
                 font = font.deriveFont(Font.BOLD, font.size.toFloat())
@@ -914,13 +1020,47 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
                 )
             }
             row.add(head, BorderLayout.NORTH)
-            row.add(
-                JBLabel("<html><body style='width:400px'>" + skill.description.replace("<", "&lt;") + "</body></html>").apply {
-                    font = font.deriveFont(font.size - 1f)
-                    foreground = UiKit.subtle
-                },
-                BorderLayout.CENTER
-            )
+
+            // 第二行：描述 + 这一技能的「元信息」。
+            //
+            // 触发词/流程/缺口/引用都是**看不见就等于不存在**的东西 ——
+            // 不给用户看到，他既不知道技能为什么会被想起来，也不知道哪条还没写全。
+            val desc = JBLabel(
+                "<html><body style='width:400px'>" + skill.description.replace("<", "&lt;") + "</body></html>"
+            ).apply {
+                font = font.deriveFont(font.size - 1f)
+                foreground = UiKit.subtle
+            }
+            val metaBits = buildList {
+                if (skill.triggers.isNotEmpty()) add("触发：" + skill.triggers.joinToString("、"))
+                if (skill.steps.isNotEmpty()) add("流程 " + skill.steps.size + " 步")
+                if (skill.crossLinks.isNotEmpty()) add("引用 " + skill.crossLinks.size + " 处")
+                if (skill.gaps.isNotEmpty()) add("待补 " + skill.gaps.size + " 处")
+            }
+            val body = JBPanel<JBPanel<*>>()/* BorderLayout */ .apply {
+                layout = BoxLayout(this, BoxLayout.Y_AXIS)
+                isOpaque = false
+            }
+            body.add(desc)
+            if (metaBits.isNotEmpty()) {
+                body.add(
+                    JBLabel(metaBits.joinToString("　·　")).apply {
+                        font = font.deriveFont(font.size - 2f)
+                        foreground = if (skill.gaps.isNotEmpty()) UiKit.warn else UiKit.faint
+                        alignmentX = java.awt.Component.LEFT_ALIGNMENT
+                        toolTipText = buildString {
+                            if (skill.gaps.isNotEmpty()) {
+                                append("还没写全的地方：\n")
+                                skill.gaps.forEach { append("· ").append(it).append('\n') }
+                            }
+                            if (skill.steps.isNotEmpty()) {
+                                append("流程步骤：").append(skill.steps.joinToString(" → "))
+                            }
+                        }
+                    }
+                )
+            }
+            row.add(body, BorderLayout.CENTER)
             // 点名称直接打开技能所在目录，省得自己去翻
             name.cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
             name.toolTipText = skill.dir.path + "\n单击在文件管理器中打开"
@@ -987,6 +1127,36 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
      *        两个库的用途不一样，所以给两个按钮 —— 只给一个的话，
      *        用户想往全局放东西会被带到项目目录里，反之亦然。
      */
+    /**
+     * 在 IDE 的编辑器里打开一个文件（文件不存在就先建出来）。
+     *
+     * 记忆文件是给用户手改的，所以「打开」比「做个编辑界面」更合适 ——
+     * Markdown 列表用 IDE 自带的编辑器改最舒服。
+     */
+    private fun openFileInEditor(file: java.io.File?) {
+        val panel = rootPanel ?: return
+        if (file == null) {
+            Messages.showWarningDialog(panel, "拿不到项目路径，无法定位记忆文件。", "记忆")
+            return
+        }
+        runCatching {
+            if (!file.isFile) {
+                file.parentFile?.mkdirs()
+                file.writeText("# 记忆\n\n<!-- AI 跨会话记住的事实。删掉一行就等于让它忘掉。 -->\n", Charsets.UTF_8)
+            }
+            val anyProject =
+                com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+                    ?: return@runCatching
+            // FileEditorManager 的方法叫 openFile(vf, focus)，不是 openFileInEditor
+            val vf = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
+                .refreshAndFindFileByIoFile(file) ?: return@runCatching
+            com.intellij.openapi.fileEditor.FileEditorManager.getInstance(anyProject)
+                .openFile(vf, true)
+        }.onFailure {
+            Messages.showWarningDialog(panel, "打不开文件：${it.message}", "记忆")
+        }
+    }
+
     private fun openSkillsDir(projectFirst: Boolean) {
         val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
         val dirs = com.zhixueyao.agent.Skills.ensureDirs(project)

@@ -48,6 +48,17 @@ class MessageBubble(
     enum class Kind { USER, ASSISTANT, SYSTEM }
 
     private companion object {
+        /**
+         * 复制用哪个剪贴板；默认系统剪贴板。
+         *
+         * 做成可替换的：headless 环境下 `Toolkit.getDefaultToolkit().systemClipboard`
+         * **直接抛 HeadlessException**，离线探针就没法验证「复制到的到底是哪一版」——
+         * 而那恰恰是踩过的 bug。探针里换成 `Clipboard("probe")`（内存剪贴板）即可。
+         * 和 `AgentRunner.providerOverride` 同一个思路：**依赖可注入、默认行为不变。**
+         */
+        @JvmStatic
+        var clipboardOverride: java.awt.datatransfer.Clipboard? = null
+
         /** 标记头部已挂过消息级操作，避免 finalize 多次调用时堆按钮 */
         const val ACTIONS_ADDED = "zhixueyao.actionsAdded"
 
@@ -488,6 +499,30 @@ class MessageBubble(
 
     /** 长回答折叠 */
     private var collapsed = false
+
+    /**
+     * 正文现在是不是**富文本**在显示。
+     *
+     * ## 为什么必须有这个字段
+     *
+     * 之前各处用的是「`richArea.text` 非空」这个**代理指标**，而它不成立：
+     * `JEditorPane` 设成 `text/html` 之后，**即使没塞过内容，text 也会是一段
+     * 百来字符的 HTML 骨架**（`<html><head></head><body>…`）—— 永远非空。
+     *
+     * 后果是个很难看的渲染 bug：
+     *  - 一条**纯文本**的长回答（没有 Markdown），`renderRichText` 判定
+     *    `looksLikeMarkdown == false` → 走 `showPlainBody()`，正文在纯文本层；
+     *  - 点「展开全文」时，代码用 `richArea.text.isNotBlank()` 判断要不要切到富文本层
+     *    → 判断为「是」→ 把纯文本层藏起来、把**空的 HTML 层**露出来
+     *    → **展开之后正文没了，一片空白**。
+     *    （折叠时又能看到预览，因为折叠分支是直接写 `bodyArea.text` 的。）
+     *
+     * 修法就是不要用代理指标：**让决定显示形态的那一步把结果记下来**，
+     * 后面所有地方用同一个判据。参考项目 kemo-agent 的前端文档里把这类问题
+     * 叫「变量链断裂 —— 样式改了但看不出变化」，根因同源：
+     * **读到的是一个「看起来相关、其实不代表真实状态」的值。**
+     */
+    private var richRendered = false
     private val collapseToggle = UiKit.linkLabel("") { }.apply { isVisible = false }
 
     /**
@@ -1447,6 +1482,7 @@ class MessageBubble(
             showPlainBody()
             return
         }
+        richRendered = true
         richArea.text = html
         richScroll.isVisible = true
         richArea.isVisible = !collapsed
@@ -1457,6 +1493,7 @@ class MessageBubble(
 
     /** 显示纯文本正文（流式中、折叠预览、渲染失败时） */
     private fun showPlainBody() {
+        richRendered = false
         // 连外层滚动容器一起隐藏 —— 只藏里面那个编辑器没用，它照样占高度
         richScroll.isVisible = false
         richArea.isVisible = false
@@ -1487,14 +1524,23 @@ class MessageBubble(
 
         collapseToggle.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
+                // **同样按「现取」而不是捕获**（见 [copyAction] 的注释）。
+                // 这个闭包只挂一次，而 [replaceContent] 会换掉正文 ——
+                // 捕获 `source` 的话，切版本之后点展开，看到的是**旧那一版**的全文。
+                val now = currentText().ifBlank { source }
                 collapsed = !collapsed
-                bodyArea.text = if (collapsed) MarkdownRenderer.stripSyntax(CollapsePolicy.preview(source)) else source
-                // 展开时把富文本（Markdown 渲染结果）换回来，折叠时用纯文本预览
-                richArea.isVisible = !collapsed && richArea.text.isNotBlank()
+                bodyArea.text =
+                    if (collapsed) MarkdownRenderer.stripSyntax(CollapsePolicy.preview(now)) else now
+                // 展开时把富文本（Markdown 渲染结果）换回来，折叠时用纯文本预览。
+                //
+                // **判据是 [richRendered]，不是 `richArea.text.isNotBlank()`** ——
+                // 后者对 JEditorPane 恒为真（它自带一段 HTML 骨架），
+                // 会让纯文本长回答「展开后一片空白」（见 richRendered 的注释）。
+                richArea.isVisible = !collapsed && richRendered
                 richScroll.isVisible = richArea.isVisible
                 bodyArea.isVisible = !richArea.isVisible
                 collapseToggle.relabel(
-                    if (collapsed) CollapsePolicy.expandLabel(source) else CollapsePolicy.COLLAPSE_LABEL
+                    if (collapsed) CollapsePolicy.expandLabel(now) else CollapsePolicy.COLLAPSE_LABEL
                 )
                 revalidate()
                 repaint()
@@ -1587,7 +1633,8 @@ class MessageBubble(
             //（有富文本显示富文本，否则显示纯文本）
             collapseToggle.isVisible = false
             collapsed = false
-            val hasRich = richArea.text.isNotBlank()
+            // 同样是 [richRendered] 而不是 richArea.text（见其注释）
+            val hasRich = richRendered
             richArea.isVisible = hasRich
             richScroll.isVisible = hasRich
             bodyArea.isVisible = !hasRich
@@ -1631,17 +1678,17 @@ class MessageBubble(
         // 按 kind 决定之后，这类错配从根上不可能出现。
         when (kind) {
             Kind.ASSISTANT -> {
-                actionsLeft.add(copyAction(source, "复制这条回答"))
+                actionsLeft.add(copyAction("复制这条回答") { currentText() })
                 onRegenerate?.let { cb -> actionsLeft.add(iconAction(UiKit.refresh, "重新生成这条回答", cb)) }
                 // 助手**不给编辑**：回答是模型产出，要改就重新生成（用户明确要求去掉）
             }
 
             Kind.USER -> {
-                actionsLeft.add(copyAction(source, "复制这条消息"))
+                actionsLeft.add(copyAction("复制这条消息") { currentText() })
                 onEdit?.let { cb -> actionsLeft.add(iconAction(UiKit.edit, "把这条消息放回输入框，并撤回它之后的回复", cb)) }
             }
 
-            Kind.SYSTEM -> actionsLeft.add(copyAction(source, "复制"))
+            Kind.SYSTEM -> actionsLeft.add(copyAction("复制") { currentText() })
         }
 
         // 右侧脚注：助手消息带模型名 + token 用量，用户消息只有时间
@@ -1655,7 +1702,8 @@ class MessageBubble(
     }
 
     private fun copyToClipboard(text: String) {
-        val clipboard = java.awt.Toolkit.getDefaultToolkit().systemClipboard
+        val clipboard = clipboardOverride
+            ?: java.awt.Toolkit.getDefaultToolkit().systemClipboard
         clipboard.setContents(java.awt.datatransfer.StringSelection(text), null)
     }
 
@@ -1673,10 +1721,23 @@ class MessageBubble(
      * 图标按钮没有文字可改，所以反馈走图标 —— 但**必须有反馈**：
      * 静默成功等于失败（用户不知道到底复制上没有）。
      */
-    private fun copyAction(text: String, tooltip: String): JButton {
+    /**
+     * 复制按钮。
+     *
+     * **文本要 [textOf] 现取，不能在构造时捕获。**
+     *
+     * 这里踩过一个很容易忽略的 bug：原来签名是 `copyAction(text: String, ...)`，
+     * 闭包把 `text` 捕获死。而按钮只挂一次（`ACTIONS_ADDED` 守卫），
+     * 切换版本走 [replaceContent] 时**新文本换不进去** ——
+     * 结果「切到第 2 版，点复制，粘出来是第 1 版」。
+     *
+     * 参考项目 astravia 在同类问题上的修法是「以正文 contentKey 为唯一复原条件」——
+     * 同一个思路：**闭包里只留取当前值的入口，不要留值本身。**
+     */
+    private fun copyAction(tooltip: String, textOf: () -> String): JButton {
         val button = UiKit.iconButton(UiKit.copy, tooltip, 1) { }
         button.addActionListener {
-            copyToClipboard(text)
+            copyToClipboard(textOf())
             button.icon = UiKit.check
             javax.swing.Timer(1200) {
                 button.icon = UiKit.copy

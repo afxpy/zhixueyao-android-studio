@@ -27,7 +27,15 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class AgentRunner(
     private val project: Project,
-    private val mcpManager: McpManager
+    /**
+     * MCP 管理器。
+     *
+     * **可空**：没有 MCP 的运行器是一个有意义的状态 ——
+     * 离线回归（`ScriptedProvider` + 真实循环）不需要任何外部服务，
+     * 而 `McpManager` 是 final 类、既不能继承也不能代理，硬造一个假的做不到。
+     * 传 null 时：工具清单里不含 MCP 工具，调用 MCP 工具会明确报错（而不是静默失败）。
+     */
+    private val mcpManager: McpManager? = null
 ) {
 
     private val log = Logger.getInstance(AgentRunner::class.java)
@@ -128,7 +136,22 @@ class AgentRunner(
          *
          * 借鉴自参考项目 astravia 的 steer 机制。
          */
-        steering: () -> List<String> = { emptyList() }
+        steering: () -> List<String> = { emptyList() },
+        /**
+         * 替换掉默认的模型接入（**只给离线回归用**）。
+         *
+         * 为什么需要这个口子：Agent 循环里最容易出错的东西 —— 工具编排、
+         * 工具报错后能不能继续、取消能不能立刻生效、steer 有没有在 turn 边界注入、
+         * 压缩有没有触发 —— 全都**不在单元函数里**，而在这一圈循环里。
+         * 只测单元函数的话，这些地方永远测不到。
+         *
+         * 传了它就能用「脚本化的假模型」驱动**真实的循环**（见 `ScriptedProvider`）：
+         * 零 token、无网络、可进回归。
+         *
+         * 默认 null = 行为与之前**逐字节一致**（参考项目 mavis 的 "Off by default" 原则：
+         * 可选能力不配置时不得改变既有行为）。
+         */
+        providerOverride: com.zhixueyao.llm.LlmProvider? = null
     ) {
         val settings = ZhixueyaoSettings.getInstance()
         val config = LlmConfig(
@@ -152,7 +175,8 @@ class AgentRunner(
             return
         }
 
-        val provider = com.zhixueyao.llm.Providers.createProvider(settings.apiFormat)
+        val provider = providerOverride
+            ?: com.zhixueyao.llm.Providers.createProvider(settings.apiFormat)
 
         // 组装工具清单：内置工具（经预设过滤） + 已连接的 MCP 工具。
         // 真正的 specs 在循环里每轮重算（MCP 工具会中途增减），这里只准备过滤好的内置工具。
@@ -237,6 +261,16 @@ class AgentRunner(
             var completed: ChatMessage? = null
             var failure: String? = null
 
+            // **provider 抛出的异常必须有兜底**。
+            //
+            // 现有两个 provider 内部都自己 runCatching、把错转成 LlmEvent.Failure，
+            // 所以这条路径平时不走 —— 但那是**它们的实现细节，不是接口契约**。
+            // 一旦某个 provider（新加的厂商、第三方实现、将来重构）漏了一处，
+            // 异常就会直接冒到界面，表现为「点了发送没反应」或 IDE 报错弹窗
+            // （故障注入探针 AgentLoopProbe 场景③ 就是这么把它们逼出来的）。
+            //
+            // 这里兜住并转成 onError，与 provider 自己报错走同一条出口。
+            val threw = runCatching {
             provider.streamChat(
                 config = config,
                 messages = outgoing,
@@ -265,6 +299,19 @@ class AgentRunner(
                     }
                 }
             )
+            }.exceptionOrNull()
+
+            if (threw != null) {
+                // 取消导致的异常不算错误（用户自己按的停止）
+                if (!cancelFlag.get()) {
+                    AgentLog.record(AgentLog.Kind.ERROR, "模型接入抛出异常", "${threw.message}")
+                    listener.onError(
+                        "模型接入出错：${threw.message ?: threw.javaClass.simpleName}" +
+                            "\n\n可以检查：接口地址与密钥是否正确、网络是否可用、模型名是否存在。"
+                    )
+                }
+                return
+            }
 
             if (cancelFlag.get()) {
                 listener.onComplete(ThinkMarkerSplitter.stripAll(finalText.toString()), steps, usageOrNull())
@@ -481,9 +528,10 @@ class AgentRunner(
         }.toMutableList()
         var skipped = 0
 
-        if (includeMcp) {
+        val mcp = mcpManager
+        if (includeMcp && mcp != null) {
             runCatching {
-                for (pt in mcpManager.allTools()) {
+                for (pt in mcp.allTools()) {
                     // 只读模式下只放行服务器**明确声明**为只读的工具。
                     //
                     // 为什么必须这么做：内置工具走 preset.allowTool() 白名单，
@@ -539,9 +587,14 @@ class AgentRunner(
         return try {
             val mcpName = McpManager.parsePrefixed(call.name)
             if (mcpName != null) {
+                val m = mcpManager ?: return ToolResult(
+                    "这个会话没有连接 MCP，无法调用 ${call.name}。" +
+                        "请到 设置 → 插件 里配置并启用对应的服务器。",
+                    ok = false
+                )
                 // 把取消标志传下去：MCP 调用最长要等 2 分钟，
                 // 不传的话用户点「停止」得干等它超时（用户反馈过）
-                val result = mcpManager.callTool(call.name, call.argsAsJson(), cancelFlag)
+                val result = m.callTool(call.name, call.argsAsJson(), cancelFlag)
                 ToolResult(
                     if (result.isError) "工具执行出错：${result.text}" else result.text,
                     ok = !result.isError
@@ -622,6 +675,25 @@ object ToolRegistry {
     )
 
     /**
+     * 工程与外部能力。
+     *
+     * 这一组是**后来补上的最大一块空白**：在这之前插件只能「读代码、改代码、编译」，
+     * 不能看历史、不能上网、不能算。而参考项目里这些都是基础配置 ——
+     * agents-universe 有 `git_repo` / `web_fetch` / `code_executor`，
+     * insight-agents 有「沙箱定量计算」，astravia 有内置终端。
+     *
+     * 补上之后，很多原来只能靠模型记忆和心算的问题，变成了**有真实依据**的：
+     * 「这段代码为什么变成这样」→ git log/blame；
+     * 「这个 API 怎么用」→ web_fetch 查官方文档；
+     * 「占比是多少」→ run_script 真跑一遍。
+     */
+    val devTools: List<AgentTool> = listOf(
+        com.zhixueyao.tools.GitTool(),
+        com.zhixueyao.tools.RunScriptTool(),
+        com.zhixueyao.tools.WebFetchTool()
+    )
+
+    /**
      * 交互类工具：任务清单 + 让用户拍板。
      *
      * 与其它工具的区别：它们不碰代码，产出的是**给用户看的界面**。
@@ -635,10 +707,14 @@ object ToolRegistry {
         // 自管理：装技能 / 配 MCP。写的是**插件自己的配置目录**，不碰工程文件，
         // 所以只读预设里也放行 —— 「帮我装个技能」不该因为当前是研究模式就做不了
         com.zhixueyao.tools.InstallSkillTool(),
-        com.zhixueyao.tools.ManageMcpTool()
+        com.zhixueyao.tools.ManageMcpTool(),
+        // 记忆同理：写的是自己的配置目录，不碰工程。而且**只读研究最需要记住结论** ——
+        // 「读了半天得出的判断」下次不该重读一遍
+        com.zhixueyao.tools.MemoryTool()
     )
 
-    val all: List<AgentTool> = fileTools + searchTools + buildTools + interactionTools
+    val all: List<AgentTool> =
+        fileTools + searchTools + buildTools + devTools + interactionTools
 
     fun byName(name: String): AgentTool? = all.firstOrNull { it.name == name }
 
@@ -654,10 +730,42 @@ object ToolRegistry {
      * 只放「名字 + 一句话说明」，正文等模型用 skill 工具来取 ——
      * 把所有技能正文都塞进提示词既费 token 又互相干扰。
      */
-    private fun skillCatalog(): String =
-        com.zhixueyao.agent.Skills.catalogForPrompt(
-            com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-        )
+    /**
+     * 技能目录 + 写作速查。
+     *
+     * @param project 用来找「项目技能库」；null 时只列全局的。
+     *
+     * **以前这里自己去 `ProjectManager.getInstance().openProjects.firstOrNull()` 拿项目** ——
+     * 那是全局状态，导致这个函数在离线探针里直接 NPE（MockApplication 没有 ProjectManager），
+     * 也就没法验证「提示词里到底带了什么」。改成参数传入后，
+     * 纯函数部分可以随便测（SkillFieldsProbe 场景④ 就是在测它）。
+     */
+    private fun skillCatalog(project: com.intellij.openapi.project.Project?): String =
+        com.zhixueyao.agent.Skills.catalogForPrompt(project) +
+            // 技能写作速查。
+            //
+            // 为什么放在**系统提示词**而不是工具描述里：技能库是「越用越好」的东西，
+            // 而写得好不好直接决定它下次会不会被想起来。工具描述只在模型真去调
+            // install_skill 时才有语境，提示词则是每轮都在 —— 攒经验这个动作
+            // 本来就不该只在「用户让我装技能」时才发生。
+            //
+            // 只留最关键的 4 条，约 150 token。抄自参考项目 agents-universe 的
+            // skill-authoring-guide（它那份很全，但全量塞进来不值这个 token）。
+            """
+
+            ## 怎么写一个好技能（攒经验时对照）
+
+            1. **正文写可执行的步骤与判据**，不写「注意规范」这种空话。
+               好例子：「改 ui/ 前先对照清单：圆角必须自绘、BoxLayout 要设 alignmentX」。
+            2. **`triggers` 必须填**（2-5 条，逗号分隔，**别写单字**）。
+               写「用户可能的不同说法」，不是把技能名换个说法。
+               不填的话它只能靠模型自己想起来 —— 那等于没写。
+            3. **`scope=project` 还是 `global`**：换个项目还用得上吗？
+               用得上 → global；只对这个工程成立（目录结构、构建方式、踩过的坑）→ project。
+            4. **有缺口就标出来**：正文里写
+               `<!-- gaps: ["真机交互还没验证"] -->`，
+               下次更新时就知道该补什么，而不是重写一遍。
+            """.trimIndent()
 
     /**
      * 当前沙盒档位对应的行为说明。
@@ -666,9 +774,16 @@ object ToolRegistry {
      * 模型仍然会回答「我看不到你的桌面」—— 机制是通的，是提示词在骗自己
      * （用户反馈「这都看不到我其他盘的东西」）。
      */
-    private fun sandboxRule(): String {
-        val base = com.intellij.openapi.project.ProjectManager.getInstance().openProjects
-            .firstOrNull()
+    /**
+     * 沙盒规则那一段。
+     *
+     * 与 [skillCatalog] 同一处改动：**项目由参数传进来，不自己去查全局状态**。
+     * 原因也一样 —— 读全局状态让这个函数在离线探针里直接 NPE
+     * （`ProjectManager.getInstance()` 在 MockApplication 下是 null），
+     * 于是「提示词到底写了什么」就永远验不了。
+     */
+    private fun sandboxRule(project: com.intellij.openapi.project.Project?): String {
+        val base = project
             ?.let { com.zhixueyao.agent.Sandbox.projectBase(it) }
             ?.toString() ?: "（项目根目录）"
         return when (com.zhixueyao.agent.Sandbox.mode()) {
@@ -737,9 +852,25 @@ object ToolRegistry {
     fun systemPrompt(
         projectName: String,
         presetId: String = "standard",
+        /**
+         * 当前项目。
+         *
+         * 用来找「项目技能库」；`null` 时只列全局技能。
+         * **不要在这里再退回全局查找** —— 调用方本来就有 project，
+         * 自己去找全局状态只会让这个函数没法离线验证。
+         */
+        project: com.intellij.openapi.project.Project? = null,
         mcpInstructions: List<Pair<String, String>> = emptyList(),
         /** 本会话的临时产物目录（[com.zhixueyao.agent.SessionWorkspace]）；空串 = 不注入这一段 */
-        workspacePath: String = ""
+        workspacePath: String = "",
+        /**
+         * 本条消息命中的技能提示（[Skills.renderTriggerHint]）；空串 = 没命中，不占 token。
+         *
+         * 放在**系统提示词的靠后位置**：它和「这一轮具体要做什么」有关，
+         * 而系统提示词整体是每轮重发的固定开销 —— 靠后也照样会被看到，
+         * 但不会被误当成长期约定。
+         */
+        triggerHint: String = ""
     ): String {
         val preset = AgentPresets.byId(presetId)
         val mcpBlock = if (mcpInstructions.isEmpty()) "" else buildString {
@@ -760,6 +891,17 @@ object ToolRegistry {
 
         你可以直接用工具**给自己加能力**，不需要让用户去设置里手点：
 
+        - `git`：看历史与改动（status/diff/log/show/blame）与提交。
+          **改代码前先看一眼这段代码为什么长这样**，比读十遍当前代码有用。
+          不提供 push / reset --hard / clean —— 那类操作让用户自己决定。
+        - `web_fetch`：抓网页。**查 API 用法、报错含义、版本变化时必须用它** ——
+          库的 API 是最容易过时的东西，凭记忆答错一个参数名会让用户白改半天。
+          只抓公网，不访问本机与内网。
+        - `run_script`：跑几行 Python / Node 做定量计算。
+          **凡是涉及数数、占比、解析、试正则的，都用它真跑一遍**，不要心算 ——
+          它的价值正是「结果是真的，不是估的」。
+        - `memory`：跨会话记住事实。听到「以后都这样」「记住」就记下来，
+          否则下次开新会话用户又要重说一遍。
         - `install_skill`：技能库的读写入口（安装 / 更新 / 删除 / 列出）。
           用户说「给我装个 XXX 的技能 / 帮我固化一下这套流程」时用它。
           正文要写成**可执行的步骤与判据**，别写空泛的「注意规范」。
@@ -785,7 +927,11 @@ object ToolRegistry {
 
         装完的东西下一轮对话就能用，不必重启 IDE。
 
-        ${skillCatalog()}
+        ${skillCatalog(project)}
+
+        ${if (triggerHint.isBlank()) "" else triggerHint}
+
+        ${com.zhixueyao.agent.MemoryStore.renderForPrompt(project)}
 
         ## 产物放哪里（**先看这一节再动手**）
 
@@ -793,7 +939,7 @@ object ToolRegistry {
 
         ## 文件访问权限
 
-        ${sandboxRule()}
+        ${sandboxRule(project)}
 
         ## 回复语言
 
