@@ -127,6 +127,80 @@ absolute.startsWith(base)   // ✗ 项目里放一个 link -> C:/Windows 就废�
 新建文件还不存在时，用**最近的已存在祖先**判断。提示里要写出真实路径，
 否则用户不知道为什么被拒。
 
+## 11. git 连不上 GitHub：两个几乎必踩的坑
+
+国内环境下 `git push` 报这几种错，**根因往往和你想的不一样**：
+
+```
+fatal: unable to access '...': Failed to connect to github.com:443 after 21089 ms
+fatal: unable to access '...': Recv failure: Connection was reset
+fatal: unable to access '...': schannel: server closed abruptly (missing close_notify)
+fatal: unable to access '...': CONNECT tunnel failed, response 502
+```
+
+### 坑 1：**git 只认小写的 `https_proxy`，不读大写的 `HTTPS_PROXY`**
+
+这是最坑的一条 —— 环境里明明有代理：
+
+```
+HTTP_PROXY=http://127.0.0.1:57567
+HTTPS_PROXY=http://127.0.0.1:57567
+```
+
+`curl` 用它们是正常的，但 **git 不读大写形式**，于是它一直在**裸连**，
+表现就是「解析正常、连不上、每次等 21 秒超时」。
+
+**诊断方法（两步就能定位）**：
+```bash
+# 1. 两个域名分别测 —— 通与不通的对比本身就是线索
+curl -s -o /dev/null -w "%{http_code}\n" https://api.github.com     # 通（200）
+curl -s -o /dev/null -w "%{http_code}\n" https://github.com          # 不通
+
+# 2. 看环境里到底有没有代理
+echo "$HTTPS_PROXY" ; echo "$https_proxy"
+```
+
+**修法**：给 git 显式配上（**建议只配到单个仓库**，别写全局 ——
+代理端口会变，全局配置挂了会影响所有仓库）：
+```bash
+git config http.proxy http://127.0.0.1:57567
+git config https.proxy http://127.0.0.1:57567
+```
+
+### 坑 2：Windows 默认 TLS 后端 `schannel` 走代理会断
+
+配上代理之后如果变成这个错：
+
+```
+schannel: server closed abruptly (missing close_notify)
+```
+
+那就是 TLS 后端的问题，换 `openssl`：
+
+```bash
+git config http.sslBackend openssl
+```
+
+**两条一起用才通**。`curl` 能通 ≠ git 能通 —— 它们的 TLS 实现和代理读取方式都不同。
+
+### 判断「推送到底成没成」
+
+**只认这一行**：
+```
+   旧sha..新sha  main -> main
+```
+有它就是服务器已经收下并更新了引用。
+
+**别信**：
+- `Everything up-to-date` —— 实测出现过**推送实际没成功却报这句**的情况
+  （本地引用状态和实际不一致时）
+- 推送之后的 `git fetch` / `git ls-remote` 失败 —— 那是**验证通道**的问题，不是推送失败
+
+**最可靠的验证**：查 GitHub API（走 `api.github.com`，往往和 `github.com` 是两条路）
+```bash
+curl -s "https://api.github.com/repos/<owner>/<repo>/commits?per_page=1"
+```
+
 ## 10. Git Bash 会改写参数里的 `:` —— 别用它验证「文件在不在远端」
 
 **症状**：`git cat-file -e "origin/main:path/to/file"` 报「缺」，
