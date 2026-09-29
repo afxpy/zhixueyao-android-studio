@@ -1,0 +1,75 @@
+<idea-plugin>
+    <id>com.zhixueyao.agent</id>
+    <name>止血药</name>
+    <vendor>zhixueyao</vendor>
+
+    <description><![CDATA[
+    <p><b>止血药</b> —— 面向 Android Studio / IntelliJ 平台的 AI 编程助手。</p>
+    <ul>
+      <li>接入任意 OpenAI 兼容模型（DeepSeek / 通义 / Kimi / 自建中转 / Ollama）与 Anthropic Claude</li>
+      <li>内置 IDE 代码工具：读文件、全文搜索、符号查找、编译诊断、执行构建</li>
+      <li>支持 MCP 协议，可挂载外部 MCP 服务器扩展能力</li>
+      <li>支持图片与文件上传，选中代码直接提问</li>
+      <li>AI 改动以差异预览确认后应用，全程可撤销</li>
+      <li>可反向作为 MCP 服务器，让外部 AI 工具调用 IDE 的索引能力</li>
+    </ul>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.lang</depends>
+    <depends>com.intellij.java</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow
+            id="止血药"
+            anchor="right"
+            secondary="false"
+            icon="/icons/toolwindow.svg"
+            factoryClass="com.zhixueyao.ui.ChatToolWindowFactory"/>
+        <applicationService serviceImplementation="com.zhixueyao.settings.ZhixueyaoSettings"/>
+        <!-- McpServerRegistry 带 @State 注解，必须注册成 service，
+             否则 getService(...) 返回 null 并抛 NullPointerException -->
+        <applicationService serviceImplementation="com.zhixueyao.mcp.McpServerRegistry"/>
+        <!-- 项目打开后建全局配置目录、合并 ~/.zhixueyao/mcp.json。
+             不用 applicationInitializedListener：启动关键路径上不该做文件 IO -->
+        <postStartupActivity implementation="com.zhixueyao.agent.ZhixueyaoStartup"/>
+        <applicationConfigurable
+            parentId="tools"
+            instance="com.zhixueyao.settings.ZhixueyaoConfigurable"
+            id="com.zhixueyao.settings"
+            displayName="止血药"/>
+    </extensions>
+
+    <actions>
+        <action
+            id="Zhixueyao.AskSelection"
+            class="com.zhixueyao.ui.AskSelectionAction"
+            text="用止血药解释这段代码"
+            description="把选中的代码发送到止血药对话窗口">
+            <add-to-group group-id="EditorPopupMenu" anchor="first"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt Z"/>
+        </action>
+        <action
+            id="Zhixueyao.OpenChat"
+            class="com.zhixueyao.ui.OpenChatAction"
+            text="止血药对话"
+            description="打开止血药对话窗口">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action
+            id="Zhixueyao.Regenerate"
+            class="com.zhixueyao.ui.RegenerateAction"
+            text="重新生成上一条回答"
+            description="丢弃最后一条回答，让 AI 重新生成"/>
+        <action
+            id="Zhixueyao.ClearChat"
+            class="com.zhixueyao.ui.ClearChatAction"
+            text="清空对话"
+            description="清空当前对话历史"/>
+        <action
+            id="Zhixueyao.OpenSettings"
+            class="com.zhixueyao.ui.OpenSettingsAction"
+            text="止血药设置…"
+            description="打开止血药的模型、插件与预设设置"/>
+    </actions>
+</idea-plugin>

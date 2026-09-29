@@ -1,0 +1,45 @@
+.gradle/
+build/
+out/
+.idea/
+*.iml
+.kotlin/
+local.properties
+
+# ---------- 下面这些是后补的，每条都写了理由 ----------
+
+# **开发过程的工作目录**（日志、临时脚本、草稿）。
+# 它不属于这个工程本身 —— 提交上去会把仓库搞脏，
+# 而且里面记的是「我怎么一步步做到这里的」，不是「这个工程是什么」。
+.workbuddy/
+
+# Gradle wrapper 的 jar 是**必需**的（wrapper 靠它启动），
+# 上面 `build/` 那条不会误伤它，但显式留个说明免得以后有人手贱忽略全 *.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# 本地配置：可能含有本机特有的东西（路径、凭据）。
+# `zhixueyao.xml` 正常存在 IDE 配置目录，这里防它被误放进工程。
+zhixueyao.xml
+.env
+.env.*
+
+# 密钥类文件 —— **双保险**。
+# 真正的防线是「不要写进代码」；这里防的是万一漏了别让它进去。
+# 单独列出来是因为这几类的代价特别大：一旦提交并推送，历史里就永久留着，
+# 只能改密钥、不能改历史。
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+secrets.properties
+
+# 系统杂项
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# **本地平台缓存**：IDE 的布局索引、本地 IDE 产物、以及跑测试时起的 sandbox。
+# 这些是**每台机器会自己重新生成**的东西，而且 sandbox 里还带着构建出来的 jar。
+.intellijPlatform/
