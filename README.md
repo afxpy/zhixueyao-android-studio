@@ -45,16 +45,20 @@
 | 项目 | 要求 |
 | --- | --- |
 | JDK | 21 |
-| Android Studio | 2026.1（build 261）或更高 |
 | Gradle | 使用仓库内的 Gradle Wrapper |
-| 系统 | Windows、macOS 或 Linux；构建脚本需要本机 Android Studio 安装目录 |
+| Android Studio | 可选 —— 本机装了就直接用；没装会自动下载 |
+| 系统 | Windows、macOS 或 Linux |
 
-构建脚本按以下顺序查找 Android Studio：
+构建脚本按以下顺序查找**本机**的 Android Studio：
 
 1. `-PstudioPath=...`
 2. `gradle.properties` 中的 `studioPath=...`
 3. `ANDROID_STUDIO_HOME` 环境变量
 4. 常见默认安装目录
+
+**都没找到时自动改用下载模式**：由 Gradle 插件从官方源下载 Android Studio 2026.1.3.8 发行包（首次约 1.5GB，之后走 Gradle 缓存）。CI（如 GitHub Actions）走的就是这条路 —— 不需要在 CI 上预装 Android Studio。
+
+想强制走下载模式（忽略本机安装）验证 CI 行为：加 `-PstudioDownload=true`；想换下载的版本：加 `-PstudioDownloadVersion=<版本号>`。
 
 Windows PowerShell 示例：
 
