@@ -91,7 +91,31 @@ object ProcessRunner {
         }
         val started = System.currentTimeMillis()
 
-        val pb = ProcessBuilder(command)
+        val process = try {
+            newBuilder(command, workingDir, extraEnv).start()
+        } catch (e: Exception) {
+            return Result(
+                -1, "",
+                "无法启动命令：${e.message}\n（可执行文件不存在或没有执行权限？）",
+                durationMs = System.currentTimeMillis() - started
+            )
+        }
+        return awaitAndCollect(process, cancelFlag, timeoutMs, started)
+    }
+
+    /**
+     * 装配进程构造器。
+     *
+     * 抽出来是因为 [run] 和 [start] 都要用同一套环境变量 ——
+     * 两份的话迟早会分叉（git 那三个变量只要漏一个，命令就会挂在交互提示上
+     * 直到超时，而错误信息里完全看不出原因）。
+     */
+    private fun newBuilder(
+        command: List<String>,
+        workingDir: File,
+        extraEnv: Map<String, String>
+    ): ProcessBuilder =
+        ProcessBuilder(command)
             .directory(workingDir)
             .apply {
                 // 这几个是**必需的**，不是为了好看：
@@ -109,16 +133,19 @@ object ProcessRunner {
                 environment().putAll(extraEnv)
             }
 
-        val process = try {
-            pb.start()
-        } catch (e: Exception) {
-            return Result(
-                -1, "",
-                "无法启动命令：${e.message}\n（可执行文件不存在或没有执行权限？）",
-                durationMs = System.currentTimeMillis() - started
-            )
-        }
-
+    /**
+     * 并发读两个流 + 分片等待 + 超时/取消。
+     *
+     * 从 [run] 里抽出来的：`start()` 走的是「不等待」那条路，
+     * 但**读流这一步它一样要有**（不读的话子进程会卡在写上）——
+     * 所以干脆把「起读流」也封进来，两条路共用。
+     */
+    private fun awaitAndCollect(
+        process: Process,
+        cancelFlag: AtomicBoolean?,
+        timeoutMs: Long,
+        started: Long
+    ): Result {
         // 并发读两个流 —— 串行读会死锁（见类注释）
         val outBuf = StringBuilder()
         val errBuf = StringBuilder()
@@ -169,19 +196,15 @@ object ProcessRunner {
      * 继续占着终端/网络（用户点「停止」却发现还在跑）。
      * 先 `destroy()` 给它收尾的机会，等一小会儿再 `destroyForcibly()`。
      */
-    private fun killTree(process: Process) {
-        runCatching {
-            process.descendants().forEach { runCatching { it.destroy() } }
-            process.destroy()
-            if (!process.waitFor(400, TimeUnit.MILLISECONDS)) {
-                process.descendants().forEach { runCatching { it.destroyForcibly() } }
-                process.destroyForcibly()
-            }
-        }
+    internal fun killTree(process: Process) {
+        // 实现搬到了 com.zhixueyao.util.ProcessTree —— 因为 MCP 传输那边也要杀进程树
+        // （`npx` 起 MCP 服务器时，杀掉 `npx` 不等于杀掉真正的服务）。
+        // **一份实现**：下次谁要调策略，只改一处。
+        com.zhixueyao.util.ProcessTree.kill(process)
     }
 
     /** 开一个线程把流读干净（不读的话子进程会卡在写上） */
-    private fun drain(
+    internal fun drain(
         stream: java.io.InputStream,
         into: StringBuilder
     ): Thread = Thread {
@@ -201,6 +224,98 @@ object ProcessRunner {
         isDaemon = true
         name = "zhixueyao-proc-drain"
         start()
+    }
+
+    // ---------------- 后台执行 ----------------
+
+    /**
+     * 起一个**不等它结束**的进程。
+     *
+     * ## 为什么需要这条路
+     *
+     * [run] 是阻塞的，这在「跑 gradle test」这种几十秒到几分钟的命令上会占满一整轮：
+     * 模型只能干等，用户也只能干等。但很多命令**本来就不该等**：
+     *
+     * - 起一个开发服务器 / 日志跟踪（根本不会自己结束）
+     * - 一次完整构建（几分钟，期间可以做别的分析）
+     * - `gradlew --watch` 这类常驻任务
+     *
+     * 走后台之后模型可以「起 → 去干别的 → 回来收结果」，
+     * 也可以在跑的同时回应用户。
+     *
+     * ## 与 [run] 的差别只有一点：**不等待**
+     *
+     * 读流、杀进程树、环境变量这些**完全共用**（[newBuilder] + [Handle]）——
+     * 后台进程如果漏了「并发读流」，它会卡在写上永远不结束，
+     * 而表现是「任务一直 running」，很难查。共用就没有这个风险。
+     */
+    fun start(
+        command: List<String>,
+        workingDir: File,
+        extraEnv: Map<String, String> = emptyMap()
+    ): Handle {
+        val process = newBuilder(command, workingDir, extraEnv).start()
+        val handle = Handle(process, command, workingDir)
+        handle.startPumping()
+        return handle
+    }
+
+    /**
+     * 一个正在后台跑的进程的句柄。
+     *
+     * 输出**随跑随取**：读流线程一直在往缓冲区里追加，
+     * [stdout]/[stderr] 拿的是「到目前为止」的内容 ——
+     * 这正是「看它跑到哪了」需要的语义。
+     */
+    class Handle internal constructor(
+        private val process: Process,
+        val command: List<String>,
+        val workingDir: File
+    ) {
+        private val outBuf = StringBuilder()
+        private val errBuf = StringBuilder()
+
+        /** 是否是被主动停掉的（用来和「自己失败退出」区分） */
+        @Volatile
+        var stopped: Boolean = false
+            private set
+
+        val startedAt: Long = System.currentTimeMillis()
+
+        val pid: Long get() = runCatching { process.pid() }.getOrDefault(-1L)
+
+        val alive: Boolean get() = process.isAlive
+
+        /** 已经跑了多久（毫秒） */
+        fun elapsedMs(): Long = System.currentTimeMillis() - startedAt
+
+        /** 结束了才有退出码；还在跑返回 null */
+        fun exitCode(): Int? =
+            if (process.isAlive) null else runCatching { process.exitValue() }.getOrNull()
+
+        /**
+         * 取「到目前为止」的输出。
+         *
+         * 加锁与 [drain] 里的写入用同一把锁（都是那个 StringBuilder 对象）——
+         * 不加锁读的话，正好撞上 append 的中途会读到半截字符串
+         * （StringBuilder 不是线程安全的，读到的是什么完全看运气）。
+         */
+        fun stdout(): String = synchronized(outBuf) { outBuf.toString() }
+
+        fun stderr(): String = synchronized(errBuf) { errBuf.toString() }
+
+        /** 叫停：杀进程**以及它的子孙**（理由见 [killTree]） */
+        fun stop() {
+            stopped = true
+            killTree(process)
+        }
+
+        internal fun startPumping() {
+            drain(process.inputStream, outBuf)
+            drain(process.errorStream, errBuf)
+            // stdin 关掉，否则有些命令会等着输入（同样是「一直 running」的经典成因）
+            runCatching { process.outputStream.close() }
+        }
     }
 
     // ---------------- 便捷入口 ----------------

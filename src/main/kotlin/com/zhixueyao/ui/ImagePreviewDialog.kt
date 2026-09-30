@@ -132,8 +132,8 @@ class ImagePreviewDialog(
 
         com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
             val result = runCatching { decode(file) }
-            com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
-                if (token != loadToken) return@invokeLater   // 用户已经翻到别的图了
+            com.zhixueyao.ui.UiKit.ui {
+                if (token != loadToken) return@ui   // 用户已经翻到别的图了
                 result.onSuccess {
                     image = it
                     fitToWindowInternal()   // 换图先适应窗口，不然上一张的倍率套到这张会很怪
@@ -483,32 +483,60 @@ internal object PreviewIcons {
         g.drawLine(s / 2 - 2, (s - 3) / 2 + 1, s / 2 + 2, (s - 3) / 2 + 1)
     }
 
-    /** 适应窗口：方框 + 四角 */
+    /**
+     * 适应窗口：**四角向外撑开**的箭头。
+     *
+     * 原来画的是「方框 + 四角各两段短刻度」。问题是**那些刻度太小了** ——
+     * 图标只有十几像素，两段 3px 的短线在高分屏上看不出来，
+     * 于是整个图标看起来就是一个**空方框**，和旁边的「原始大小」几乎一样。
+     *
+     * 用户的原话：「适应窗口那个按钮有问题」—— 他说不出哪里有问题，
+     * 因为**它看起来什么都没表达**。
+     *
+     * 现在改成四角朝外的斜箭头，和「原始大小」的 1:1 方框有明确区别。
+     */
     fun fit() = icon { g, s ->
-        g.drawRect(2, 3, s - 5, s - 7)
-        g.drawLine(2, 3, 5, 3); g.drawLine(2, 3, 2, 6)
-        g.drawLine(s - 3, 3, s - 6, 3); g.drawLine(s - 3, 3, s - 3, 6)
-        g.drawLine(2, s - 4, 5, s - 4); g.drawLine(2, s - 4, 2, s - 7)
-        g.drawLine(s - 3, s - 4, s - 6, s - 4); g.drawLine(s - 3, s - 4, s - 3, s - 7)
+        val m = 3                       // 边距
+        val a = 4                       // 箭头长度
+        // 中间的小方框（比外框小一圈，暗示「被放进窗口里」）
+        g.drawRect(s / 2 - 2, s / 2 - 2, 4, 4)
+        // 四个角朝外
+        g.drawLine(m, m, m + a, m); g.drawLine(m, m, m, m + a)
+        g.drawLine(s - m, m, s - m - a, m); g.drawLine(s - m, m, s - m, m + a)
+        g.drawLine(m, s - m, m + a, s - m); g.drawLine(m, s - m, m, s - m - a)
+        g.drawLine(s - m, s - m, s - m - a, s - m); g.drawLine(s - m, s - m, s - m, s - m - a)
     }
 
-    /** 原始大小：1:1 的方框 */
+    /**
+     * 原始大小：1:1 的方框。
+     *
+     * 保持原样 —— 用户反馈里这是**没问题的**那一个（`1:1` 字样够明确）。
+     * 记在这里是为了说明：改图标时不要顺手把好的也改了。
+     */
     fun actual() = icon { g, s ->
         g.drawRect(3, 3, s - 7, s - 7)
         g.font = g.font.deriveFont(7f)
         g.drawString("1:1", 3, s - 4)
     }
 
+    /**
+     * 上一张：**单个**左尖角。
+     *
+     * 原来画的是「竖线 + 三角」= `|◁`，那个符号的含义是**「跳到第一张」**
+     * （大多数播放器/看图工具都是这个约定）。于是按钮做的事（上一张）
+     * 和它看起来要做的事（跳到开头）对不上 —— 用户根本不敢点。
+     *
+     * 去掉竖线就对了：单尖角 = 上一张，这是跨平台的通用画法。
+     */
     fun prev() = icon { g, s ->
-        g.drawLine(4, 3, 4, s - 3)
-        g.drawLine(11, 3, 5, s / 2)
-        g.drawLine(5, s / 2, 11, s - 3)
+        g.drawLine(s - 4, 3, 4, s / 2)
+        g.drawLine(4, s / 2, s - 4, s - 3)
     }
 
+    /** 下一张：单个右尖角（理由同上，去掉原来那根竖线） */
     fun next() = icon { g, s ->
-        g.drawLine(s - 4, 3, s - 4, s - 3)
-        g.drawLine(5, 3, 11, s / 2)
-        g.drawLine(11, s / 2, 5, s - 3)
+        g.drawLine(4, 3, s - 4, s / 2)
+        g.drawLine(s - 4, s / 2, 4, s - 3)
     }
 
     /** 用系统程序打开：方框 + 出框箭头 */

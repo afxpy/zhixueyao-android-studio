@@ -232,9 +232,12 @@ object SessionWorkspace {
     }
 
     private fun writeMarker(file: File, id: String, title: String, createdAt: Long) {
-        file.writeText(
-            """{"id":"${id.replace("\"", "")}","title":"${title.replace("\"", "")}","createdAt":$createdAt}""",
-            Charsets.UTF_8
+        // 原子写入。marker 是「这个临时目录属于哪次会话」的唯一凭据 ——
+        // 它坏了，目录就成了**没人认领的孤儿**（清理时对不上、也说不清该不该删），
+        // 而读取端是 runCatching 兜底的，坏了不会报错，只是「认不出来」。
+        com.zhixueyao.util.AtomicFiles.write(
+            file,
+            """{"id":"${id.replace("\"", "")}","title":"${title.replace("\"", "")}","createdAt":$createdAt}"""
         )
     }
 

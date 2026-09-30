@@ -28,10 +28,8 @@ class ZhixueyaoSettings : PersistentStateComponent<ZhixueyaoSettings> {
      * 这样切换服务商时不必反复重填密钥 —— 每个服务商记住自己的那份。
      * [apiKey] 始终是「当前生效」的那一份，两者保持同步。
      */
-    var providerKeys: MutableMap<String, String> = mutableMapOf()
 
     /** 各服务商上次用过的模型名，切换时自动恢复。 */
-    var providerModels: MutableMap<String, String> = mutableMapOf()
 
     /**
      * 各服务商「已添加」的模型清单，供菜单里展开二级列表。
@@ -43,10 +41,8 @@ class ZhixueyaoSettings : PersistentStateComponent<ZhixueyaoSettings> {
      * 每条编码为 `providerId|modelName`。读取时用 **limit = 2** 切分，
      * 所以模型名里即便自带 `|` 也会被完整保留在第二段，不会被切错。
      */
-    var providerModelEntries: MutableList<String> = mutableListOf()
 
     /** 各服务商自定义的接口地址（覆盖预设值，留空表示用预设）。 */
-    var providerBaseUrls: MutableMap<String, String> = mutableMapOf()
 
     /**
      * 用户自建的服务商（中转站 / 自建网关），可以并存多个。
@@ -140,8 +136,20 @@ class ZhixueyaoSettings : PersistentStateComponent<ZhixueyaoSettings> {
     /** 是否让 AI 展示任务清单（关掉后 todo_write 工具会直接告知模型不必调用） */
     var showTaskList: Boolean = true
 
-    /** 是否允许 AI 用选项询问用户（关掉后模型须自己决策并说明假设） */
+    /** 是否让 AI 用选项询问用户（关掉后模型须自己决策并说明假设） */
     var allowAskUser: Boolean = true
+
+    /**
+     * 是否允许 AI 派子代理（`spawn_agent` 等四个工具）。
+     *
+     * 默认**开着** —— 它省的是上下文，属于「开着更好」的那类；
+     * 但它会**多打接口**（一个子代理就是一条独立的模型调用链），
+     * 所以给一个关掉的开关：用户如果按量计费、或者发现费用涨了，可以关。
+     *
+     * 关掉后 `spawn_agent` 等工具**根本不进工具清单** ——
+     * 不是「进了但不让用」，那样模型会反复尝试、白烧几轮。
+     */
+    var enableSubagent: Boolean = true
 
     /**
      * 长对话模式：上下文接近窗口上限时自动增量压缩。
@@ -174,16 +182,32 @@ class ZhixueyaoSettings : PersistentStateComponent<ZhixueyaoSettings> {
      */
     var artifactEntries: MutableList<String> = mutableListOf()
 
+    // ---------------- 按 providerId 索引的三张表 + 一个清单 ----------------
+    //
+    // 用扁平的 `Map<String, String>` 而不是嵌套结构 ——
+    // 平台 XML 序列化对嵌套集合支持不稳（同 artifactEntries 的路子）。
+    //
+    // ⚠️ 这一段被误删过一次：我用「有没有被别处读」的机械检查判定它们没人用，
+    // 而那个检查**把本文件排除在外**（本来是为了避免把「设置页里的存取」
+    // 算成「使用」），于是本文件里这一大堆真实用法全都没被看见。
+    // **检查的判据错了，不是字段没用。** 恢复时把这条教训写在旁边。
+    var providerKeys: MutableMap<String, String> = mutableMapOf()
+    var providerModels: MutableMap<String, String> = mutableMapOf()
+    var providerBaseUrls: MutableMap<String, String> = mutableMapOf()
+
+    /** 自定义服务商的条目清单（同样是扁平编码，见 [artifactEntries] 的说明） */
+    var providerModelEntries: MutableList<String> = mutableListOf()
+
     override fun getState(): ZhixueyaoSettings = this
 
     override fun loadState(state: ZhixueyaoSettings) {
         XmlSerializerUtil.copyBean(state, this)
-        // 旧版本没有这几个 map，反序列化后可能为 null
+        // 旧版本没有这几个集合，反序列化后可能为 null
         if (providerKeys == null) providerKeys = mutableMapOf()
         if (providerModels == null) providerModels = mutableMapOf()
         if (providerBaseUrls == null) providerBaseUrls = mutableMapOf()
-        if (customProviders == null) customProviders = mutableListOf()
         if (providerModelEntries == null) providerModelEntries = mutableListOf()
+        if (customProviders == null) customProviders = mutableListOf()
 
         // 一次性迁移：老版本把「默认收起」写进了配置，于是新默认「实时展开」对老用户不生效
         // （用户反馈「我没看见有虚字出现」）。迁一次即可。
@@ -293,6 +317,45 @@ class ZhixueyaoSettings : PersistentStateComponent<ZhixueyaoSettings> {
         providerKeys[pid] ?: if (pid == providerId) apiKey else ""
 
     /** 记录密钥并同步到当前生效值。 */
+    // ---------------- Git 助手 ----------------
+
+    /**
+     * Git 助手总开关。关掉之后，下面这些设置一律不生效、
+     * git 命令也不会带上任何代理参数 —— 等于插件没碰过 git。
+     */
+    var gitHelperEnabled: Boolean = false
+
+    /**
+     * 访问方式。三个值，用字符串而不是枚举：
+     * 配置是存成 XML 的，字符串对不上时能**安全降级**（读不认识的值就当 direct），
+     * 而枚举的 `valueOf` 会抛异常 —— 那会让升级后的设置页直接打不开。
+     *
+     *  - `direct`：直连（**并显式清掉代理**，见 GitProxyDetector.directArgs）
+     *  - `proxy`：自定义代理，地址在 [gitProxyUrl]
+     *  - `vpn`：本地 VPN 工具，端口自动检测（或用 [gitVpnPort]）
+     */
+    var gitAccessMode: String = "direct"
+
+    /** 自定义代理地址，如 `http://127.0.0.1:7890` */
+    var gitProxyUrl: String = ""
+
+    /** VPN 工具端口。0 = 每次自动检测（推荐，VPN 换端口不用改设置） */
+    var gitVpnPort: Int = 0
+
+    /**
+     * Git 用户名。
+     *
+     * **这里只存用户名，token 走 [com.zhixueyao.git.GitCredentials] 的加密存储** ——
+     * 用户名不是秘密，token 是。
+     */
+    var gitUserName: String = ""
+
+    /** 提交署名（git config user.name）。和 gitUserName 不是一回事 */
+    var gitAuthorName: String = ""
+
+    /** 提交邮箱（git config user.email） */
+    var gitAuthorEmail: String = ""
+
     fun rememberKey(pid: String, key: String) {
         providerKeys[pid] = key
         if (pid == providerId) apiKey = key

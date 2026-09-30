@@ -38,6 +38,9 @@ class StdioTransport(
 
     override val description: String get() = "stdio: ${command.joinToString(" ")}"
 
+    /** 进程还在、且没被主动关掉 */
+    override fun isAlive(): Boolean = alive.get()
+
     private class PendingCall(val latch: CountDownLatch = CountDownLatch(1)) {
         @Volatile var response: Json.Obj? = null
     }
@@ -179,13 +182,19 @@ class StdioTransport(
         alive.set(false)
         failAllPending("连接已关闭")
         runCatching { writer?.close() }
-        runCatching { process?.destroy() }
-        // 给进程一点优雅退出的时间，超时则强杀，避免残留进程
-        runCatching {
-            if (process?.isAlive == true && !process!!.waitFor(1500, TimeUnit.MILLISECONDS)) {
-                process!!.destroyForcibly()
-            }
-        }
+        // **必须杀进程树，不能只 destroy 父进程。**
+        //
+        // 目录里所有 MCP 服务器都是 `npx -y @xxx/server` 起的，而 `npx`
+        // 只是一层壳 —— 真正的服务是它拉起来的子进程（Windows 上 `npx` 还是个 .cmd 包装，
+        // 杀掉包装，node 照跑）。
+        //
+        // 原来这里是 `process.destroy()` + `waitFor` + `destroyForcibly()`，
+        // 三样都只作用于**父进程**：结果是「用户点了断开，服务器进程还在跑」——
+        // 继续占着端口（下次启动报端口被占用）、继续占内存，而且**再也不会被回收**。
+        //
+        // 这个问题 ProcessRunner 那边早就解决过（见它的 killTree 注释），
+        // 只是当时没抽出来共用。现在两处共用 com.zhixueyao.util.ProcessTree。
+        com.zhixueyao.util.ProcessTree.kill(process)
     }
 }
 
@@ -202,7 +211,19 @@ class StreamableHttpTransport(
 
     private var sessionId: String? = null
 
+    /** 是否已被显式关闭（HTTP 没有长连接，只能靠这个标记） */
+    @Volatile
+    private var closed = false
+
     override val description: String get() = "http: $url"
+
+    /**
+     * HTTP 是无状态的 —— 没有「连接」可断，所以只要没被显式关掉就算可用，
+     * 真正可达性由每次请求自己决定（失败会如实报错）。
+     *
+     * 不在这里做探活：那会让**每次查询状态**都发一次网络请求。
+     */
+    override fun isAlive(): Boolean = !closed
 
     override fun exchange(
         message: Json.Obj,
@@ -316,6 +337,10 @@ class StreamableHttpTransport(
     }
 
     override fun close() {
+        // **必须在任何提前 return 之前置位。**
+        // 下面 `val sid = sessionId ?: return` 在没握过手的情况下会直接返回 ——
+        // 标记放在后面的话，这种 HTTP 传输会被永远当成「还活着」。
+        closed = true
         // 按规范发送会话终止请求，失败也无所谓
         val sid = sessionId ?: return
         runCatching {

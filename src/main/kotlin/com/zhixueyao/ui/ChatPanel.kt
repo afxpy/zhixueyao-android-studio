@@ -2673,6 +2673,20 @@ class ChatPanel(private val project: Project) : JBPanel<ChatPanel>(BorderLayout(
                                     estimated = com.zhixueyao.agent.ContextCompactor.estimateTokens(finalText),
                                     steps = steps
                                 )
+                                // **把附件路径存进这条消息。**
+                                //
+                                // 不加这一步的话，气泡上的预览卡只活在内存里 ——
+                                // 重开会话就全没了，只剩正文里那句「已生成一张图片」。
+                                //
+                                // 位置就在「重新生成」那段旁边：它用的
+                                // `history.indexOfLast { ASSISTANT }` 和 `copy(...)`
+                                // 正是这里要用的同一个模式，照抄即可。
+                                val attachIdx = history.indexOfLast { it.role == ChatMessage.Role.ASSISTANT }
+                                val paths = b.attachedPathsSnapshot()
+                                if (attachIdx >= 0 && paths.isNotEmpty()) {
+                                    history[attachIdx] = history[attachIdx].copy(attachments = paths)
+                                }
+
                                 // 「重新生成」：把新回答追加成新版本，旧版留着可切回
                                 if (regenVariants.isNotEmpty()) {
                                     val idx = history.indexOfLast { it.role == ChatMessage.Role.ASSISTANT }
@@ -3185,7 +3199,7 @@ class ChatPanel(private val project: Project) : JBPanel<ChatPanel>(BorderLayout(
         }
         row.add(bubble, BorderLayout.CENTER)
         messagesPanel.add(row)
-        messagesPanel.add(Box.createVerticalStrut(8))
+        messagesPanel.add(UiKit.strut(8))
         trimMessages()
     }
 
@@ -3380,6 +3394,14 @@ class ChatPanel(private val project: Project) : JBPanel<ChatPanel>(BorderLayout(
             bubble.appendText(turn.assistantText)
             // replay = true：重建的气泡**不显示耗时**（没有真实起始时间，算出来是假的）
             bubble.finalize(turn.assistantText, onRegenerate = { regenerate() }, replay = true)
+            // **把存档里的附件重新挂回气泡。**
+            //
+            // 不重建的话，重开会话后缩略图就没了（用户反馈「怎么图片不见了」）——
+            // 而正文里那句「已生成一张图片」还在，看起来像插件把图弄丢了。
+            //
+            // 直接调 addAttachment：它会自己判断文件在不在（不在就退化成文件卡片），
+            // 所以临时产物被清理过的情况也不会炸。
+            turn.lastAssistant?.attachments?.forEach { bubble.addAttachment(it) }
             // 重载后页脚也要有用量（否则「翻历史看不到 token」又回来了）
             if (turn.promptTokens > 0 || turn.completionTokens > 0) {
                 bubble.setUsage(turn.promptTokens, turn.completionTokens)
@@ -3515,7 +3537,7 @@ class ChatPanel(private val project: Project) : JBPanel<ChatPanel>(BorderLayout(
 
         welcomePage = page
         messagesPanel.add(page)
-        messagesPanel.add(Box.createVerticalStrut(8))
+        messagesPanel.add(UiKit.strut(8))
 
         // 未配置模型时的引导卡片，放在一个「槽」里而不是直接 add ——
         // 这样设置改完之后可以重新求值（见 refreshSetupCard）。
@@ -3556,7 +3578,7 @@ class ChatPanel(private val project: Project) : JBPanel<ChatPanel>(BorderLayout(
         if (needCard) {
             if (slot.componentCount == 0) {
                 slot.add(buildSetupCard())
-                slot.add(Box.createVerticalStrut(8))
+                slot.add(UiKit.strut(8))
             }
         } else {
             slot.removeAll()
@@ -3823,7 +3845,8 @@ class ChatPanel(private val project: Project) : JBPanel<ChatPanel>(BorderLayout(
                     onHover = { h -> hovered = h; repaint() },
                     onClick = {
                         menu.isVisible = false
-                        if (!isCurrent) openSession(meta.id)
+                        // 见 openSessionAsync 的注释：这里原来是在 EDT 上直接读文件的
+                        if (!isCurrent) openSessionAsync(meta.id)
                     }
                 )
             }
@@ -4008,15 +4031,68 @@ class ChatPanel(private val project: Project) : JBPanel<ChatPanel>(BorderLayout(
      * 它们是给模型看的中间结果，界面上显示一串原始 JSON 只会干扰阅读；
      * 但它们**保留在 history 里**，否则模型会失去上下文。
      */
-    private fun openSession(id: String) {
+    /**
+     * 正在载入哪个会话 —— 用来挡一个竞态。
+     *
+     * 用户在读盘期间又点了另一条时，两个后台任务回来的**顺序不保证**，
+     * 不挡的话可能把新选的那条覆盖成旧的。
+     */
+    private var loadingTargetId: String? = null
+
+    /**
+     * 异步载入会话：**读文件在后台，重建界面在 EDT**。
+     *
+     * ## 这是在「EDT 上的阻塞 I/O」扫描里查出来的
+     *
+     * 原来点一下会话是这么走的：
+     *
+     * ```
+     * onClick（Swing 回调 = EDT）
+     *   └─ SessionStore.load(id)     同步读 JSON
+     *   └─ 重建所有气泡              长循环
+     * ```
+     *
+     * **整段都压在 EDT 上。** 小会话几毫秒感觉不出来，
+     * 但会话会随使用时间变大 —— 几百条消息加附件之后，点一下就是肉眼可见的一卡。
+     *
+     * 用户还没报过，因为他的会话还不够大。**这类 bug 是长出来的** ——
+     * 等它自己暴露时，用户已经卡惯了。
+     *
+     * ## 拆开的界线
+     *
+     * 不是「哪边方便」，而是 **「碰不碰 Swing 组件」**：
+     * 读写文件在后台，动组件必须回 EDT（Swing 只在 EDT 上安全）。
+     */
+    private fun openSessionAsync(id: String) {
         if (isRunning) {
             Messages.showInfoMessage(project, "正在生成中，请先等待结束或点击停止", "止血药")
             return
         }
-        val session = com.zhixueyao.chat.SessionStore.load(id) ?: run {
-            updateStatus("这个会话读不出来了，可能已被删除")
-            return
+        updateStatus("正在载入会话…")
+        loadingTargetId = id
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            // 只有这一步能在后台：读文件。异常也在这里挡掉，
+            // 否则后台一抛，下面那句 invokeLater 就永远不执行 —— 界面停在「正在载入会话…」
+            val loaded = try {
+                com.zhixueyao.chat.SessionStore.load(id)
+            } catch (t: Throwable) {
+                null
+            }
+            com.zhixueyao.ui.UiKit.ui {
+                if (loaded == null) {
+                    updateStatus("这个会话读不出来了，可能已被删除")
+                } else {
+                    renderSession(loaded)
+                }
+            }
         }
+    }
+
+    /** 把读好的会话铺到界面上。**必须在 EDT 上跑。** */
+    private fun renderSession(session: com.zhixueyao.chat.SessionStore.Session) {
+        // 读盘期间用户又点了别的 → 这次的结果已经过时，丢掉
+        if (loadingTargetId != null && loadingTargetId != session.id) return
+        loadingTargetId = session.id
 
         // 历史被改写/换会话：摘要必须跟着作废，否则新一段对话会「记得」没发生过的事
         summaryState.reset()

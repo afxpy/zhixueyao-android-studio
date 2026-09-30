@@ -196,13 +196,37 @@ object ContextCompactor {
         return out
     }
 
-    /** 每一轮起始消息在 [messages] 里的下标（系统消息占的位置会让下标跳号）。 */
+    /**
+     * 每一轮起始消息在 [messages] 里的下标（系统消息占的位置会让下标跳号）。
+     *
+     * ## 摘要消息**不是一轮**，必须排除
+     *
+     * 这里踩过一个很隐蔽的坑：摘要本身是一条 `role = USER` 的消息
+     * （见 [summaryMessage]），所以按「USER 就是一轮的开始」去算，
+     * **摘要会被当成第 1 轮**。
+     *
+     * 后果在 `compact` 的第 3 级（整轮丢弃）里爆发 —— 那一级是「从最旧开始丢」，
+     * 于是**第一个被丢掉的就是摘要本身**。
+     *
+     * 而摘要恰恰是**最不该丢的那一条**：
+     *
+     * - 它是整段历史的**唯一**记录（原文已经被它替换掉了）
+     * - 体积最小（几百 token）、信息密度最高
+     *
+     * 丢掉它 = 一句话把之前所有对话清空，却只省下几百 token；
+     * 而它为了省这点预算，还会把后面几轮也一起搭进去。
+     * **方向完全反了。**
+     *
+     * 排除掉之后，`starts[0]` 指向第一轮**真实对话**，第 3 级丢的就是它该丢的东西。
+     */
     private fun turnStartIndices(messages: List<ChatMessage>): List<Int> {
         val out = mutableListOf<Int>()
         var seenContent = false
         for (i in messages.indices) {
             val m = messages[i]
             if (m.role == ChatMessage.Role.SYSTEM) continue
+            // 摘要不是对话轮次，是**背景元数据** —— 不参与「丢弃」的候选
+            if (isSummaryMessage(m)) continue
             if (m.role == ChatMessage.Role.USER || !seenContent) out.add(i)
             seenContent = true
         }

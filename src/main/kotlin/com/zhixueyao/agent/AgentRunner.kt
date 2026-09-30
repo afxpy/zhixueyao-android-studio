@@ -109,6 +109,15 @@ class AgentRunner(
 
         /** 摘要本身的最大输出 */
         const val SUMMARY_MAX_TOKENS = 1_500
+
+        /**
+         * 子代理的兜底寿命：超过就自动停。
+         *
+         * 10 分钟。取这个数的依据：一次只读调研（读十几个文件）正常在 1-3 分钟，
+         * 给三倍余量。它挡的是**没人认领的子代理**（模型 spawn 完没 wait 就回复用户了），
+         * 不是「跑得比较慢的子代理」—— 所以宁可宽一点，别把正常任务砍了。
+         */
+        const val SUBAGENT_MAX_LIFETIME_MS = 10 * 60 * 1000L
     }
 
     /**
@@ -151,7 +160,21 @@ class AgentRunner(
          * 默认 null = 行为与之前**逐字节一致**（参考项目 mavis 的 "Off by default" 原则：
          * 可选能力不配置时不得改变既有行为）。
          */
-        providerOverride: com.zhixueyao.llm.LlmProvider? = null
+        providerOverride: com.zhixueyao.llm.LlmProvider? = null,
+        /**
+         * 嵌套层级。0 = 用户直接发起的那一轮，1 = 子代理。
+         *
+         * 用它把子代理工具**只加在最外层**：第 1 层不再加 `spawn_agent`，
+         * 于是「子代理再派子代理」在构造上就走不通。
+         *
+         * 为什么不用计数器来限深度：计数器在异常路径上容易漏减，
+         * 漏一次就会留下一条能无限派发的路径。**「工具箱里根本没有那个工具」
+         * 是没有这个问题的不变量。**
+         *
+         * （第二道保险：[com.zhixueyao.tools.SubagentRegistry.SUBAGENT_ALLOWED]
+         * 白名单里也没有 spawn_agent，所以就算有人忘了传 depth 也派不出去。）
+         */
+        depth: Int = 0
     ) {
         val settings = ZhixueyaoSettings.getInstance()
         val config = LlmConfig(
@@ -181,7 +204,34 @@ class AgentRunner(
         // 组装工具清单：内置工具（经预设过滤） + 已连接的 MCP 工具。
         // 真正的 specs 在循环里每轮重算（MCP 工具会中途增减），这里只准备过滤好的内置工具。
         val preset = AgentPresets.byId(settings.agentPreset)
-        val allowedTools = tools.filter { preset.allowTool(it.name) }
+        val allowedTools = buildList {
+            addAll(tools.filter { preset.allowTool(it.name) })
+
+            // 子代理工具**在这一层才加**，不进 ToolRegistry 的静态清单。
+            //
+            // 原因是它们要 `config` / `cancelFlag` / `providerOverride` ——
+            // 这些只有 run() 内部才有。放进静态清单的话，工具类就得自己去取，
+            // 又变成「读全局状态」，也就没法离线验证了
+            // （ToolRegistry 里那几处踩过这个坑，见其注释）。
+            //
+            // 放行条件：
+            //   depth == 0         —— 子代理不能再派子代理
+            //   预设能读文件        —— 「委派」本质是「去读书」，读都不许就别谈了
+            //   子代理有工具可用    —— 裁剪后为空时加了也是白加
+            if (depth == 0 && settings.enableSubagent && preset.allowTool("read_file")) {
+                val scoped = com.zhixueyao.tools.SubagentRegistry.scopeTools(tools)
+                if (scoped.isNotEmpty()) {
+                    add(
+                        com.zhixueyao.tools.SpawnAgentTool(tools) { job, subTools ->
+                            launchSubagent(job, subTools, config, preset, cancelFlag)
+                        }
+                    )
+                    add(com.zhixueyao.tools.ListAgentsTool())
+                    add(com.zhixueyao.tools.WaitAgentTool())
+                    add(com.zhixueyao.tools.InterruptAgentTool())
+                }
+            }
+        }
 
         var steps = 0
         val maxSteps = settings.maxToolRounds.coerceIn(1, 100)
@@ -400,6 +450,183 @@ class AgentRunner(
      * 没超预算时**原样返回传入的 list**（调用方用 `!==` 判断有没有压过），
      * 避免每轮都白白复制一份。
      */
+    /**
+     * 把一个子代理放到后台线程上跑。
+     *
+     * ## 为什么要新起线程而不是同步跑
+     *
+     * 同步版本写起来短得多，但 `interrupt_agent` 会变成**死代码**：
+     * 父代理正在 `wait` 里被卡住，根本没机会调它。异步还带来一个实打实的收益 ——
+     * 「分别看看这三块代码」可以**并行**读，串行的话三个文件组要排队。
+     *
+     * ## 为什么它有自己的系统提示词，而不是复用父代理那份
+     *
+     * 父代理那份里写着「怎么跟用户说话」「技能库目录」「当前项目沙盒规则」
+     * 等等一大堆**对一个只读侦察兵毫无用处**的东西。子代理要的是相反的指导：
+     * 少说废话、把结论压到最短、别贴大段代码 ——
+     * **它吐出来的每个字都要占父代理的上下文**，这正是委派要省的东西。
+     *
+     * 另外它**看不到父代理对话**（这正是省 token 的来源），所以任务描述里
+     * 必须自带全部背景；提示词里要明确说这一条，否则子代理会以为
+     * 「那个文件」是有所指的。
+     */
+    private fun launchSubagent(
+        job: com.zhixueyao.tools.SubagentRegistry.Job,
+        subTools: List<AgentTool>,
+        config: LlmConfig,
+        preset: AgentPresets.Preset,
+        parentCancel: java.util.concurrent.atomic.AtomicBoolean
+    ) {
+        val thread = Thread({
+            val collected = StringBuilder()
+            val subHistory = mutableListOf(
+                ChatMessage.system(subagentSystemPrompt()),
+                ChatMessage.user(job.task)
+            )
+
+            // 子代理的取消标志 = 它自己的 cancel ∪ 父代理的 cancel。
+            // 「用户点了停止」时子代理必须跟着停 —— 否则父代理都退出了，
+            // 后台还有几个线程在打接口，用户看到的是「明明停了还在烧钱」。
+            val listener = object : Listener {
+                /**
+                 * 每个事件都过一遍的两道闸。
+                 *
+                 * 放在事件回调里而不是单起一个看门狗线程：**零成本**（本就要处理事件），
+                 * 而看门狗要为一个可能只跑两秒的子代理睡十分钟。
+                 */
+                private fun checkParent() {
+                    // 闸一：用户点了停止 —— 子代理必须跟着停。
+                    // 否则父代理都退出了，后台还有几个线程在打接口，
+                    // 用户看到的是「明明停了还在烧钱」。
+                    if (parentCancel.get()) job.cancel.set(true)
+
+                    // 闸二：兜底寿命。
+                    // 为什么需要它：模型可能 spawn 完就不 wait 了（自己忘了、或者直接给用户
+                    // 回复了）。那个子代理就成了**没人认领的后台任务** ——
+                    // 结果永远取不回来，token 一直烧。
+                    // 不选「父代理一结束就全杀」是因为「这轮派、下轮取」是合理用法；
+                    // 也不选看门狗线程（见上）。
+                    if (job.elapsedMs() > SUBAGENT_MAX_LIFETIME_MS) {
+                        job.cancel.set(true)
+                        job.activity = "超过 ${SUBAGENT_MAX_LIFETIME_MS / 60_000} 分钟，自动停止"
+                    }
+                }
+
+                override fun onTextDelta(text: String) {
+                    checkParent()
+                    collected.append(text)
+                }
+
+                override fun onToolStart(call: com.zhixueyao.llm.ToolCall) {
+                    checkParent()
+                    // 这一步就是「它现在在干什么」，list_agents 直接展示给模型和用户
+                    job.activity = describeCall(call)
+                }
+
+                override fun onToolFinish(call: com.zhixueyao.llm.ToolCall, result: ToolResult) {
+                    checkParent()
+                }
+
+                override fun onComplete(finalText: String, steps: Int, usage: com.zhixueyao.llm.Usage?) {
+                    // onComplete 的 finalText 是权威版本（已剥掉思维标记），
+                    // 流式攒的那份可能有重复，所以以它为准
+                    job.result = finalText.ifBlank { collected.toString() }
+                    job.state = "done"
+                    job.activity = "已结束（$steps 步）"
+                }
+
+                override fun onError(message: String) {
+                    job.result = message
+                    job.state = "failed"
+                    job.activity = "出错"
+                }
+            }
+
+            try {
+                // 子代理用**独立实例**，不共用父代理那个 ——
+                // run() 里有一堆局部状态（steps、token 累加、压缩基线），
+                // 复用实例会让两边的计数互相污染
+                AgentRunner(project, mcpManager).run(
+                    history = subHistory,
+                    tools = subTools,
+                    listener = listener,
+                    cancelFlag = job.cancel,
+                    // 不传 steering：那是「用户中途插话」的通道，子代理不该有
+                    // 不传 summaryState：独立上下文不需要压缩（步数上限就卡住了）
+                    depth = 1
+                )
+                if (job.state == "running") {
+                    // run() 正常返回但 onComplete 没被调用 —— 只可能是被取消
+                    job.state = if (job.cancel.get()) "cancelled" else "done"
+                    if (job.result == null) job.result = collected.toString()
+                }
+            } catch (t: Throwable) {
+                // 子代理里**任何**异常都不能把父代理拖垮，也不能变成静默失败：
+                // 记进 job.result，父代理 wait 时会如实看到
+                job.state = "failed"
+                job.result = "子代理异常退出：${t.message ?: t.javaClass.simpleName}"
+                job.activity = "异常退出"
+                log.warn("子代理 ${job.id} 异常", t)
+            }
+        }, "zhixueyao-subagent-${job.id}")
+
+        // 守护线程：IDE 退出时不会因为还有子代理在跑而挂住
+        thread.isDaemon = true
+        thread.start()
+        log.info("派出子代理 ${job.id}：${job.task.take(80)}（工具 ${subTools.size} 个）")
+    }
+
+    /** 把一次工具调用说成一句人话，用于 list_agents 的「正在：」 */
+    private fun describeCall(call: com.zhixueyao.llm.ToolCall): String {
+        val arg = runCatching {
+            val o = Json.parse(call.arguments)
+            o.str("path") ?: o.str("pattern") ?: o.str("query") ?: o.str("name") ?: ""
+        }.getOrDefault("")
+        return call.name + (if (arg.isBlank()) "" else "（${arg.take(60)}）")
+    }
+
+    /**
+     * 子代理的系统提示词。
+     *
+     * 刻意写得**很短**，而且和父代理那份完全分开。三条要求都是有原因的：
+     *
+     * 1. **只读** —— 工具箱已经限制了，但提示词里也要说。否则子代理会反复尝试
+     *    调 `edit_file`，每次都被「没有这个工具」打回，白烧几轮。
+     * 2. **结论要短** —— 它吐的每个字都进父代理上下文。约束输出长度是这套机制
+     *    **省 token 的最后一环**：读了十万 token，最后回两千才划算；
+     *    回五万的话等于白委派。
+     * 3. **看不到父对话** —— 这一条不说清，子代理会写出「那个文件里……」这种
+     *    对父代理毫无信息量的话。
+     */
+    private fun subagentSystemPrompt(): String = """
+        你是一个**只读侦察子代理**，被主代理派来做一次调研。完成任务后把结论交回去。
+
+        ## 你要遵守的
+
+        1. **只能读、搜、看**。你没有任何写文件的工具，也不要试图改任何东西。
+           你的价值在于把散在多个文件里的信息汇总成一段结论。
+
+        2. **你看不到主代理和用户的对话**。任务描述里写了什么，你就只有什么。
+           如果任务描述里提到的东西你不知道在哪，就去搜 —— 不要猜，也不要反问
+           （你问不到任何人，只能自己找）。
+
+        3. **结论要短，这是硬要求**。你读的内容不会传给主代理，只有你写下的字会。
+           所以：
+           - 直接给结论和依据（`文件路径:行号` 这种定位要留）
+           - **不要贴大段代码**，最多贴关键的一两行
+           - 不要复述你搜过哪些关键词、读过哪些文件（除非那次搜索是结论的一部分）
+           - 目标长度：**能说清就行，通常十几行以内**
+
+        ## 你要做的
+
+        用 read_file / search_code / find_symbol / glob_files / list_directory
+        把任务查清楚，然后输出一段结构化结论。如果任务里问了多个问题，
+        就分点回答，每点给依据。
+
+        如果任务本身无法完成（比如要找的东西根本不存在），**直接说「没找到」并说明
+        你查了哪些方向** —— 这比编一个看似合理的答案有用得多。
+    """.trimIndent()
+
     private fun compactIfNeeded(
         history: List<ChatMessage>,
         baseline: ContextCompactor.Baseline?,
@@ -671,6 +898,9 @@ object ToolRegistry {
     val buildTools: List<AgentTool> = listOf(
         com.zhixueyao.tools.GetDiagnosticsTool(),
         com.zhixueyao.tools.RunBuildTool(),
+        // 跑测试。和 run_build 是两件事：**编译通过只说明类型对，不说明行为对** ——
+        // 「改完有没有把别的功能改坏」只有测试能回答
+        com.zhixueyao.tools.RunTestsTool(),
         com.zhixueyao.tools.ProjectStructureTool()
     )
 
@@ -690,7 +920,18 @@ object ToolRegistry {
     val devTools: List<AgentTool> = listOf(
         com.zhixueyao.tools.GitTool(),
         com.zhixueyao.tools.RunScriptTool(),
-        com.zhixueyao.tools.WebFetchTool()
+        com.zhixueyao.tools.WebFetchTool(),
+        // 后台任务三件套。**它们只在「最外层」加** ——
+        // 子代理是只读侦察兵，不该起常驻进程（那会在父代理结束后继续占着端口）。
+        // 与子代理工具同样的理由：需要 cancelFlag 之外的生命周期管理，
+        // 放进静态清单会让工具类去读全局状态。
+        com.zhixueyao.tools.RunBackgroundTool(),
+        com.zhixueyao.tools.TaskOutputTool(),
+        com.zhixueyao.tools.TaskStopTool(),
+        // 取时间。**不加它的话模型不知道今天几号** —— `git log` 里看到 2026-09-25
+        // 分不清是三天前还是三个月前，「最近一周」也只能猜。
+        // 提示词里也注入了日期作基线，两者分工见 CurrentTimeTool 的注释。
+        com.zhixueyao.tools.CurrentTimeTool()
     )
 
     /**
@@ -710,7 +951,12 @@ object ToolRegistry {
         com.zhixueyao.tools.ManageMcpTool(),
         // 记忆同理：写的是自己的配置目录，不碰工程。而且**只读研究最需要记住结论** ——
         // 「读了半天得出的判断」下次不该重读一遍
-        com.zhixueyao.tools.MemoryTool()
+        com.zhixueyao.tools.MemoryTool(),
+        // 知识库同理：读写的是 ~/.zhixueyao/kb/，不碰工程文件。
+        // **研究模式恰恰最需要它** —— 「读了很多资料」正是该沉淀成知识页的时刻。
+        com.zhixueyao.tools.KbWriteTool(),
+        com.zhixueyao.tools.KbSearchTool(),
+        com.zhixueyao.tools.KbTagsTool()
     )
 
     val all: List<AgentTool> =
@@ -849,6 +1095,33 @@ object ToolRegistry {
         """.trimIndent()
     }
 
+    /**
+     * 「今天是几号」那一行。
+     *
+     * ## 为什么必须写进提示词
+     *
+     * 加它之前，**没有任何地方告诉模型今天是什么日子** —— 后果都很具体：
+     * `git log` 里看到 `2026-09-25` 分不清是三天前还是三个月前；
+     * 「最近一周改了哪些文件」只能挑个数字去猜；用户说「下周之前搞定」算不出是哪天。
+     * 这类错误不报错、不崩，只是**答得不对**。
+     *
+     * ## 时间在这里取，还是从外面传？
+     *
+     * 这里直接取当前时间 —— 和 [com.zhixueyao.tools.CurrentTimeTool] 相反。
+     * 理由：**它没有可断言的输出**（每次调用都不同），
+     * 所以不存在「探针要验具体内容」的需求；而调用方（ChatPanel）每轮重建提示词，
+     * 天然就是新鲜的。给这个函数加一个 `now` 参数只会让所有调用点都要传时间，白增负担。
+     *
+     * 星期也要带上：判断「周末」「下周三」这类说法时，模型自己从日期推星期几
+     * 是高频出错点（闰年、跨月尤其容易错），直接给了就不用推。
+     */
+    private fun todayLine(): String {
+        val now = java.time.ZonedDateTime.now()
+        val w = listOf("一", "二", "三", "四", "五", "六", "日").getOrElse(now.dayOfWeek.value - 1) { "?" }
+        return now.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+            .toString() + "（星期$w）"
+    }
+
     fun systemPrompt(
         projectName: String,
         presetId: String = "standard",
@@ -887,6 +1160,12 @@ object ToolRegistry {
         你是「止血药」，一名嵌入 Android Studio / IntelliJ 平台的编程助手。当前项目：$projectName。
         当前运行模式：${preset.label}
 
+        今天的日期：${todayLine()}
+
+        **这条日期是本轮请求开始时取的**（提示词每一轮都会重发）。所以它足够新，
+        但如果你正在做一件跑很久的事、或者需要精确到分钟，用 current_time 再确认一次。
+        判断「几天前」时以它为基准 —— 不要凭训练数据里的时间感猜。
+
         ## 自我扩展
 
         你可以直接用工具**给自己加能力**，不需要让用户去设置里手点：
@@ -897,9 +1176,29 @@ object ToolRegistry {
         - `web_fetch`：抓网页。**查 API 用法、报错含义、版本变化时必须用它** ——
           库的 API 是最容易过时的东西，凭记忆答错一个参数名会让用户白改半天。
           只抓公网，不访问本机与内网。
+        - `git`：查历史与改动、也能提交。**push / pull 需要用户先在设置里开「Git 助手」**
+          —— 没开时调它们会被挡回来并说明去哪儿开。开了之后插件会按用户配的代理与账号去连，
+          **不会改动他的 git 配置**（参数是临时传的）。
+          推送失败时先看报错里的 `over proxy` 字样：那是配置里一个过期的代理地址，
+          不是网络不通 —— 让用户去「设置 → Git 助手」点一次「测试连接」就有结论了。
         - `run_script`：跑几行 Python / Node 做定量计算。
           **凡是涉及数数、占比、解析、试正则的，都用它真跑一遍**，不要心算 ——
           它的价值正是「结果是真的，不是估的」。
+        - `spawn_agent`：**派一个只读子代理**去独立地读、搜、看，然后只把结论带回来。
+          它读到的内容**不进我们的对话**，所以这是省上下文的主要手段。
+
+          什么时候用：**「要读很多东西，但结论只有几句话」**的时候。
+          典型场景：「找出这个功能的完整调用链」「把所有 ViewModel 扫一遍看谁没做空值处理」
+          「这个报错是从哪儿抛出来的」。这种事自己读要烧掉几万 token，
+          而其中九成内容在结论里用不到 —— 派出去，只收结论。
+
+          什么时候**不要**用：只有一个文件要看（直接 read_file 更快）、
+          需要改东西（子代理是只读的）、或者你已经在读文件了（别为了用而用）。
+
+          三个要点：
+          - 任务描述要**自带全部背景** —— 它是独立上下文，看不到我们在聊什么
+          - **必须 wait_agent 取结论**，不要凭印象猜它看到了什么
+          - 互不依赖的任务可以**一次派几个并行跑**（最多 3 个）
         - `memory`：跨会话记住事实。听到「以后都这样」「记住」就记下来，
           否则下次开新会话用户又要重说一遍。
         - `install_skill`：技能库的读写入口（安装 / 更新 / 删除 / 列出）。
@@ -919,6 +1218,26 @@ object ToolRegistry {
           这个项目特有的做法，就顺手把它固化成语技能（`action=install`；
           已有同名技能就加 `overwrite=true` 更新，**不要另起新名字**）。
           先 `action=list` 看一眼有没有现成的，比新建更省事。
+        - `run_tests`：跑测试。**`run_build` 通过只说明类型对，不说明行为对** ——
+          「这次改动有没有把别的功能改坏」只有它能回答。
+          改完涉及逻辑的代码就该跑一次；纯改文案、注释、格式不用。
+        - `run_background` / `task_output` / `task_stop`：起**不会自己结束**的命令
+          （开发服务器、日志跟踪、几分钟的完整构建）。判据很简单：
+          **「这条命令会自己跑完吗？」会 → 用同步的；不会 → 用后台的。**
+          起了之后用 `task_output` 看进度，`task_stop` 收尾 —— 常驻服务用完要停掉。
+        - `kb_search` / `kb_write`：跨项目共用的知识库。**它和 `search_code` 的分工是核心**：
+
+          | 你的处境 | 用哪个 |
+          |---|---|
+          | 记得确切的字符串（函数名、报错原文） | `search_code` |
+          | **记得有这回事、但想不起原话** | **`kb_search`** |
+          | 要沉淀一条以后还用得上的结论 | `kb_write` |
+
+          第二种是它唯一存在的理由 —— `search_code` 要求你给出确切字符串，
+          而「上次记过依赖冲突怎么处理来着」这种问题你根本不知道该搜什么词。
+          `kb_search` 返回**按相关度排序的小节**，相关度低时会明确标注
+          —— 看到那个标注就别硬当结论用。`kb_tags` 可以看里面都有什么。
+
         - `manage_mcp`：查清单、装/启停 MCP 服务器。
           用户说「接个浏览器 / 连上 GitHub / 看数据库」时，先 `action=catalog` 看有什么，
           再 `action=install` 装上；清单里没有的服务器可以 `action=import` 从本地配置导入。
@@ -926,6 +1245,20 @@ object ToolRegistry {
           装完你就能自己打开页面、点元素、读内容。
 
         装完的东西下一轮对话就能用，不必重启 IDE。
+
+        ## 找东西的时候用哪个
+
+        这四个都能「找东西」，但用途不重叠，选错了会白跑一趟：
+
+        | 你要找的是 | 用 |
+        |---|---|
+        | 某段**代码内容**（我知道大概写了什么） | `search_code`（支持正则与 `file_pattern`） |
+        | 某个**符号定义**（类/函数名，想跳到定义） | `find_symbol` |
+        | **文件名**（我知道文件叫什么） | `find_files` |
+        | **用户当前在看什么**（没说是哪个文件时） | `get_editor_context` |
+
+        用户说「帮我看看这个」「这里有问题」而没指明文件时 —— **先用 `get_editor_context`**，
+        别上来就猜文件路径。它给的是用户光标所在的位置，那通常就是他们指的「这个」。
 
         ${skillCatalog(project)}
 

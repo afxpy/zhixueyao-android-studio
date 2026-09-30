@@ -33,6 +33,9 @@ object AgentPresets {
         "read_file", "list_directory", "glob_files",
         "search_code", "find_symbol", "get_editor_context",
         "get_diagnostics", "project_structure",
+        // 取时间当然是只读的，而且**研究模式一样需要** ——
+        // 「这周的改动」「三天前的提交」在研究任务里很常见
+        "current_time",
         // web_fetch 只读网络、不碰工程 —— 研究模式正需要它查资料
         "web_fetch",
         // git 放这里：它**绝大多数用途是看历史**（这在研究模式里价值很高），
@@ -52,7 +55,14 @@ object AgentPresets {
     )
 
     /** 执行类工具 */
-    private val EXEC = setOf("run_build")
+    /**
+     * 执行类工具。
+     *
+     * `run_tests` 归这里而不是只读：**测试是有副作用的** ——
+     * 它们会写临时文件、连数据库、发网络请求。研究模式的承诺是「不改变任何东西」，
+     * 所以测试也拦在外面。（想跑测试请切到代码或标准模式。）
+     */
+    private val EXEC = setOf("run_build", "run_tests", "run_background", "task_output", "task_stop")
 
     /**
      * 交互类工具：只跟用户打交道，不碰文件系统。
@@ -61,7 +71,12 @@ object AgentPresets {
      * 「列个任务清单」「让我选一下」这些**不改动任何东西**的能力在只读模式下就没了 ——
      * 而它们恰恰是只读研究最需要的（研究任务往往步骤多、岔路多）。
      */
-    private val INTERACTION = setOf("todo_write", "ask_user", "skill", "memory")
+    private val INTERACTION = setOf(
+        "todo_write", "ask_user", "skill", "memory",
+        // 知识库：读写的是自己的资料目录，不碰工程。研究模式一样放行 ——
+        // 「读了很多资料之后沉淀成一页」正是研究任务该做的事
+        "kb_write", "kb_search", "kb_tags"
+    )
 
     val all: List<Preset> = listOf(
         Preset(

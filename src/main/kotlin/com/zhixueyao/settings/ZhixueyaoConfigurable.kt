@@ -112,6 +112,96 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
     private val languageBox = JComboBox(arrayOf("跟随系统", "简体中文", "English"))
     private val confirmSendCheck = JCheckBox("发送前确认（内容较长时先让我看一眼）")
     private val showApplyCheck = JCheckBox("代码块显示「应用」按钮（一键写入文件，可 Ctrl+Z 撤销）")
+
+    // ---------------- Git 助手 ----------------
+
+    /** 总开关。关掉之后下面所有设置都不生效，git 命令也不带任何代理参数 */
+    private val gitEnabledCheck = JCheckBox("启用 Git 助手（让 AI 能推送 / 拉取，并自动处理代理）")
+
+    /** 三种访问方式。用单选而不是下拉：只有三个选项，铺开更省一次点击 */
+    private val gitModeDirect = javax.swing.JRadioButton("直连")
+    private val gitModeProxy = javax.swing.JRadioButton("自定义代理")
+    private val gitModeVpn = javax.swing.JRadioButton("本地 VPN 工具")
+
+    private val gitProxyField = com.intellij.ui.components.JBTextField()
+    private val gitVpnPortField = com.intellij.ui.components.JBTextField()
+    private val gitUserField = com.intellij.ui.components.JBTextField()
+
+    /**
+     * Token 用 [JPasswordField]：界面上不明文显示。
+     *
+     * (它不是安全防线 —— 存在内存里的字符串照样能被读。真正的保护是
+     * [com.zhixueyao.git.GitCredentials] 把它加密存在系统密钥链里。
+     * 用密码框只是**避免肩窥和录屏泄露**。)
+     */
+    private val gitTokenField = JPasswordField()
+
+    /**
+     * 本次构建的时间戳。
+     *
+     * ## 为什么界面里要有这个
+     *
+     * 这一轮反复出现「用户报的症状和我以为的代码版本对不上」——
+     * 而**从截图看不出跑的是哪一版**。插件改了要重启 IDE 才生效，
+     * 于是「没重启」和「改了没用」在界面上长得一模一样。
+     *
+     * 有了这行时间戳，**一眼就能确认装的是哪一版**。
+     *
+     * （值是 build 时由 Gradle 写进来的；拿不到就显示「未知」。）
+     */
+    private val BUILD_STAMP: String = try {
+        // 读**这个类所在的 jar 文件**的修改时间 —— 那就是构建时间。
+        //
+        // 比「build 时写个资源文件」简单：不用改 Gradle、不用往 src 里塞文件，
+        // 而且它天然是对的（jar 被替换了它就变）。
+        val src = javaClass.protectionDomain?.codeSource?.location?.toURI()
+        val jar = src?.let { java.io.File(it) }
+        if (jar != null && jar.isFile) {
+            java.text.SimpleDateFormat("MM-dd HH:mm").format(java.util.Date(jar.lastModified()))
+        } else {
+            "开发环境"
+        }
+    } catch (e: Exception) {
+        "未知"
+    }
+
+    /** 本次自检是什么时候开始的 —— 用来算耗时 */
+    private var envStartedAt = 0L
+
+    /** 环境自检的结果区（每次检查重建里面的行） */
+    private val gitEnvBody = JBPanel<JBPanel<*>>().apply {
+        layout = javax.swing.BoxLayout(this, javax.swing.BoxLayout.Y_AXIS)
+        isOpaque = false
+        alignmentX = java.awt.Component.LEFT_ALIGNMENT
+    }
+
+    /** 署名修复行 —— **只在自检发现没配署名时才显示** */
+    private var gitAuthorFixRow: javax.swing.JComponent? = null
+    private val gitAuthorNameField2 = com.intellij.ui.components.JBTextField()
+    private val gitAuthorEmailField2 = com.intellij.ui.components.JBTextField()
+
+    /**
+     * 「当前选的这种方式是什么意思、什么时候该用它」—— 跟着单选项变。
+     *
+     * 做成动态的原因：三种方式的区别不是一句话能并列写清的，
+     * 特别是「我到底属于哪种」这件事 —— 那需要按当前选择展开讲。
+     */
+    /**
+     * 「代理地址」那一整行（标签 + 输入框 + 提示）和「VPN 端口」那一整行。
+     *
+     * 收集起来是为了**整行显隐** —— 只灰掉输入框的话，用户还是看到一堆灰框，
+     * 不知道哪些该填。连标签和提示一起收掉，页面才是「当前这种方式要填的东西」。
+     */
+    private val gitProxyRow = mutableListOf<java.awt.Component>()
+    private val gitVpnRow = mutableListOf<java.awt.Component>()
+
+    private val gitModeHelp = com.intellij.ui.components.JBLabel().apply {
+        alignmentX = java.awt.Component.LEFT_ALIGNMENT
+    }
+
+    /** 检测结果 / 状态提示。文案会动态改，所以是字段不是固定标签 */
+    private val gitStatusLabel = com.intellij.ui.components.JBLabel()
+    private val gitTokenStatusLabel = com.intellij.ui.components.JBLabel()
     private val showTokenCheck = JCheckBox("状态栏显示本轮 token 用量（服务商回报的真实值，拿不到时估算）")
     private val autoCompactCheck =
         JCheckBox("长对话模式：上下文接近模型上限时自动压缩（关掉 = 高精度，信息不丢，但聊长了会被服务端打回）")
@@ -137,6 +227,9 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
 
     /** 技能库状态文字（技能数量） */
     private val skillsInfoLabel = JBLabel()
+
+    /** 知识库状态文字（页数 / 标签数） */
+    private val kbInfoLabel = JBLabel()
 
     /** 技能目录路径（全局 / 项目 / 外部，各一行） */
     private val skillsPathLabel = JBLabel()
@@ -165,6 +258,7 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
     )
     private val showTaskListCheck = JCheckBox("让 AI 展示任务清单（多步任务时列出步骤并逐项打勾）")
     private val allowAskUserCheck = JCheckBox("允许 AI 用选项询问我（遇到岔路时给几个按钮让我点）")
+    private val enableSubagentCheck = JCheckBox("允许 AI 派只读子代理去调研（读很多文件但只带回结论，省上下文）")
 
     // ---------------- 模型页 ----------------
     private val providerBox = com.intellij.openapi.ui.ComboBox(Providers.presets.map { it.label }.toTypedArray())
@@ -256,9 +350,15 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
             s.thinkingLevels.toSet() != currentThinkingLevels().toSet() ||
             s.sandboxMode != currentSandboxMode().id ||
             s.showTaskList != showTaskListCheck.isSelected ||
+            s.enableSubagent != enableSubagentCheck.isSelected ||
             s.allowAskUser != allowAskUserCheck.isSelected ||
             s.confirmBeforeSend != confirmSendCheck.isSelected ||
             s.showApplyButton != showApplyCheck.isSelected ||
+            s.gitHelperEnabled != gitEnabledCheck.isSelected ||
+            s.gitAccessMode != currentGitMode() ||
+            s.gitProxyUrl != gitProxyField.text.trim() ||
+            s.gitVpnPort != (gitVpnPortField.text.trim().toIntOrNull() ?: 0) ||
+            s.gitUserName != gitUserField.text.trim() ||
             s.showTokenEstimate != showTokenCheck.isSelected ||
             s.autoCompact != autoCompactCheck.isSelected ||
             s.contextWindow != (contextWindowSpinner.value as Int) ||
@@ -286,6 +386,7 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
         // AI 助手行为
         s.sandboxMode = currentSandboxMode().id
         s.showTaskList = showTaskListCheck.isSelected
+        s.enableSubagent = enableSubagentCheck.isSelected
         s.allowAskUser = allowAskUserCheck.isSelected
 
         // 模型
@@ -324,6 +425,11 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
         s.replyLanguage = currentLanguage()
         s.confirmBeforeSend = confirmSendCheck.isSelected
         s.showApplyButton = showApplyCheck.isSelected
+        s.gitHelperEnabled = gitEnabledCheck.isSelected
+        s.gitAccessMode = currentGitMode()
+        s.gitProxyUrl = gitProxyField.text.trim()
+        s.gitVpnPort = gitVpnPortField.text.trim().toIntOrNull() ?: 0
+        s.gitUserName = gitUserField.text.trim()
         s.showTokenEstimate = showTokenCheck.isSelected
         s.autoCompact = autoCompactCheck.isSelected
         s.contextWindow = contextWindowSpinner.value as Int
@@ -346,25 +452,73 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
         refreshProviderStatus()
     }
 
+    /**
+     * 按当前设置启停 IDE 内置的 MCP 服务。
+     *
+     * ## 为什么整体挪到后台
+     *
+     * 这个函数在 `reset()` 里被调（也就是**打开设置页时**），原来是同步的 ——
+     * 于是「**在 EDT 上启动一个 HTTP 服务器**」。而 `McpServerController.start()`
+     * 第一步是 `stop()`，那里**会等线程池终止**：
+     *
+     * > 讽刺的是，那个「等终止」正是我上一轮修「线程池不关」时加的 ——
+     * > 修好了线程泄漏，却**给 EDT 加了一个新的阻塞点**。
+     * > 两次改动各自都对，合起来就不对了。
+     *
+     * 所以整段挪到后台，界面标签用 `invokeLater` 回填。
+     *
+     * **注意 `wasEnabled` 的比较要留在 EDT 侧读**（它来自 check 组件的状态），
+     * 不能等到后台再读 —— 那时用户可能已经又点了。
+     */
+    /**
+     * 按当前设置启停 IDE 内置的 MCP 服务。
+     *
+     * ## 为什么整段挪到后台
+     *
+     * 这个函数在 `reset()` 里被调（也就是**打开设置页时**），原来是同步的 ——
+     * 于是「**在 EDT 上启动一个 HTTP 服务器**」。而 `McpServerController.start()`
+     * 第一步是 `stop()`，那里**会等线程池终止**。
+     *
+     * > 讽刺的是，那个「等终止」正是我上一轮修「线程池不关」时加的 ——
+     * > 修好了线程泄漏，却**给 EDT 加了一个新的阻塞点**。
+     * > 两次改动各自都对，合起来就不对了。
+     *
+     * 所以整段挪到后台，界面标签用 `invokeLater` 回填。
+     *
+     * **注意设置值要在 EDT 侧先读出来**（`wantEnabled` / `port`）——
+     * 不能等后台再读，那时用户可能已经又改动过了。
+     */
     private fun applyMcpServerState(wasEnabled: Boolean) {
         val s = ZhixueyaoSettings.getInstance()
-        val service = McpServerController.getInstance()
+        val wantEnabled = s.mcpServerEnabled
+        val port = s.mcpServerPort
+        val basePath = com.zhixueyao.tools.KnowledgeBase.root().absolutePath
 
-        if (s.mcpServerEnabled) {
-            val ok = service.start(s.mcpServerPort)
-            if (!ok) {
-                mcpStatusLabel.text = "启动失败，端口 ${s.mcpServerPort} 可能已被占用"
-                mcpStatusLabel.foreground = UiKit.danger
-            } else {
-                mcpStatusLabel.text = "运行中：http://127.0.0.1:${s.mcpServerPort}/"
-                mcpStatusLabel.foreground = UiKit.ok
+        mcpStatusLabel.text = "正在处理…"
+        mcpStatusLabel.foreground = UiKit.subtle
+
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            val service = McpServerController.getInstance()
+            // 后台只碰服务，**不碰任何 Swing 组件**
+            val ok = try {
+                if (wantEnabled) service.start(port) else { service.stop(); true }
+            } catch (t: Throwable) {
+                false
             }
-        } else if (wasEnabled) {
-            service.stop()
-            mcpStatusLabel.text = "已停止"
-            mcpStatusLabel.foreground = UiKit.faint
+            UiKit.ui {
+                if (!wantEnabled) {
+                    mcpStatusLabel.text = if (wasEnabled) "已停止" else "未启用"
+                    mcpStatusLabel.foreground = UiKit.faint
+                } else if (!ok) {
+                    mcpStatusLabel.text = "启动失败，端口 $port 可能已被占用"
+                    mcpStatusLabel.foreground = UiKit.danger
+                } else {
+                    mcpStatusLabel.text = "运行中：http://127.0.0.1:$port/"
+                    mcpStatusLabel.foreground = UiKit.ok
+                }
+                configSnippetArea.text = McpController.clientConfigJson(port)
+            }
         }
-        configSnippetArea.text = McpController.clientConfigJson(s.mcpServerPort)
     }
 
     override fun reset() {
@@ -381,6 +535,19 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
         }
         confirmSendCheck.isSelected = s.confirmBeforeSend
         showApplyCheck.isSelected = s.showApplyButton
+        gitEnabledCheck.isSelected = s.gitHelperEnabled
+        // 读不认识的值就当 direct 安全降级（见设置项那边的注释）
+        when (s.gitAccessMode) {
+            "proxy" -> gitModeProxy.isSelected = true
+            "vpn" -> gitModeVpn.isSelected = true
+            else -> gitModeDirect.isSelected = true
+        }
+        gitProxyField.text = s.gitProxyUrl
+        gitVpnPortField.text = if (s.gitVpnPort > 0) s.gitVpnPort.toString() else ""
+        gitUserField.text = s.gitUserName
+        gitTokenField.text = ""
+        refreshGitVisibility()
+        runEnvCheck()
         showTokenCheck.isSelected = s.showTokenEstimate
         autoCompactCheck.isSelected = s.autoCompact
         contextWindowSpinner.value = s.contextWindow
@@ -401,10 +568,12 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
 
         // 技能库
         refreshSkillsInfo()
+        refreshKbInfo()
 
         // AI 助手行为
         sandboxModeBox.selectedIndex = Sandbox.Mode.entries.indexOf(Sandbox.Mode.byId(s.sandboxMode))
         showTaskListCheck.isSelected = s.showTaskList
+        enableSubagentCheck.isSelected = s.enableSubagent
         allowAskUserCheck.isSelected = s.allowAskUser
 
         // 模型
@@ -506,14 +675,102 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
 
         // 右侧是唯一滚动区域。导航栏放在滚动区域外，始终固定在左侧，
         // 不会因为模型页或 MCP 页内容很长而跟着向上滚出视口。
-        val cards = JBPanel<JBPanel<*>>(cardLayout).apply { isOpaque = false }
-        cards.add(buildGeneralPage(), "general")
-        cards.add(buildModelPage(), "model")
-        cards.add(buildMcpPage(), "plugins")
-        cards.add(buildPresetsPage(), "presets")
+        /**
+         * 卡片容器。**重写了 `getPreferredSize` —— 这是这一页大量空白的根因。**
+         *
+         * ## 问题
+         *
+         * `CardLayout` 的默认 `preferredSize` 是**所有卡片里最大的那个**（它要保证
+         * 随便切到哪张都不被裁）。而这个设置页里 MCP 页最长 ——
+         * 于是**每一页都被按 MCP 页的高度算**，短页面（Git 助手、临时会话）
+         * 后面就拖着一大片空白，而且**能一直往下滑、下面却没东西**。
+         *
+         * 用户的原话：「每个分类里都有大量的空白，可以往下滑但下面没有内容」。
+         *
+         * ## 为什么不是去掉 `form.finish()`
+         *
+         * 那个 glue 的 `preferredSize` 是 0（它只吃剩余空间），**不是它撑高的**。
+         * 我去查了才敢下结论 —— 不然又是一次「修好一个不是问题的问题」。
+         *
+         * ## 修法
+         *
+         * 只按**当前可见的那张卡片**算高度。切页时 `revalidate()` 会重新问一次，
+         * 于是每页各有各的高度。
+         */
+        val cards = object : JBPanel<JBPanel<*>>(cardLayout) {
+            override fun getPreferredSize(): java.awt.Dimension {
+                // 先问当前可见的那张卡片 —— 这才是用户真正在看的内容
+                components.firstOrNull { it.isVisible }?.let { return it.preferredSize }
+                return super.getPreferredSize()
+            }
+
+            // 最小宽度仍然取所有卡片的最大值：太窄会让表格横向滚动条乱跳
+            override fun getMinimumSize(): java.awt.Dimension {
+                val w = components.maxOfOrNull { it.minimumSize.width } ?: 0
+                val h = components.firstOrNull { it.isVisible }?.minimumSize?.height ?: 0
+                return java.awt.Dimension(w, h)
+            }
+        }.apply { isOpaque = false }
+
+        /**
+         * 建一页，**崩了也不连累别的页**。
+         *
+         * ## 为什么必须隔离（用户报的 bug 就是这个）
+         *
+         * 原来是一串裸的 `cards.add(buildXxxPage(), "xxx")`。
+         * 只要**中间某一页抛异常**，`buildBody` 就断在那里 ——
+         * 它和它**后面所有页**都不会被加进卡片容器。
+         *
+         * 而 `CardLayout.show(容器, "git")` 在容器里找不到那个名字时，
+         * **表现就是一片空白**：不报错、不提示、导航项还在。
+         * 用户看到的是「点了 Git 助手，什么都没有」，
+         * 而真正崩掉的地方可能在**别的页**里。
+         *
+         * 这个失败模式特别难查：**症状的位置和原因的位置不重合**。
+         *
+         * ## 隔离之后
+         *
+         * 一页崩了 → 那一页显示一段可读的错误 + 堆栈摘要，其余页照常。
+         * 这样用户能**直接把原因念出来**，而不是只能说「空白」。
+         */
+        fun addPage(name: String, title: String, build: () -> JComponent) {
+            val page = try {
+                build()
+            } catch (t: Throwable) {
+                // 不吞异常：把消息和最关键的两行堆栈显示出来。
+                // 「安静地降级」在这里是错的 —— 用户需要知道有个页面坏了。
+                val msg = t.message ?: t.javaClass.simpleName
+                val where = t.stackTrace.take(3).joinToString("\n") { "    at $it" }
+                com.intellij.openapi.diagnostic.Logger.getInstance(
+                    ZhixueyaoConfigurable::class.java
+                ).warn("设置页「$title」构建失败", t)
+
+                JBPanel<JBPanel<*>>(java.awt.BorderLayout()).apply {
+                    isOpaque = false
+                    border = JBUI.Borders.empty(18)
+                    add(
+                        com.intellij.ui.components.JBLabel(
+                            "<html><b>「$title」这一页没能加载出来。</b><br><br>" +
+                                "原因：${msg.replace("<", "&lt;")}<br><br>" +
+                                "<font color='gray'>其余设置不受影响，可以直接用。<br>" +
+                                "这段信息可以直接反馈给插件作者：</font>" +
+                                "<pre style='font-size:9px'>$where</pre></html>"
+                        ).apply { alignmentX = java.awt.Component.LEFT_ALIGNMENT },
+                        java.awt.BorderLayout.NORTH
+                    )
+                }
+            }
+            cards.add(page, name)
+        }
+
+        addPage("general", "通用") { buildGeneralPage() }
+        addPage("model", "模型") { buildModelPage() }
+        addPage("plugins", "插件") { buildMcpPage() }
+        addPage("git", "Git 助手") { buildGitPage() }
+        addPage("presets", "Agent 预设") { buildPresetsPage() }
         // 临时会话管理：全局临时产物的「看得见 + 能删」入口。
         // 那些目录不在任何工程里，不给入口就等于永远不会被清理。
-        cards.add(tempSessionsPanel.build(), "temp")
+        addPage("temp", "临时会话") { tempSessionsPanel.build() }
         contentPanel = cards
         val contentScroll = JBScrollPane(cards).apply {
             border = JBUI.Borders.empty()
@@ -525,7 +782,7 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
 
         SECTIONS.forEachIndexed { index, section ->
             navPanel.add(buildNavButton(index, section.second, section.third))
-            navPanel.add(Box.createVerticalStrut(2))
+            navPanel.add(UiKit.strut(2))
         }
 
         body.add(navWrapper, BorderLayout.WEST)
@@ -599,7 +856,13 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
     private fun select(index: Int) {
         if (index !in SECTIONS.indices) return
         selectedSection = index
-        contentPanel?.let { cardLayout.show(it, SECTIONS[index].first) }
+        contentPanel?.let {
+            cardLayout.show(it, SECTIONS[index].first)
+            // 切页后必须重算 —— 高度是按「当前可见的那张卡」算的（见 cards 的注释），
+            // 不重新验证的话还会用上一页的高度
+            it.revalidate()
+            it.repaint()
+        }
         navPanel.components.filterIsInstance<JPanel>().forEachIndexed { i, panel ->
             val label = panel.components.filterIsInstance<JLabel>().firstOrNull() ?: return@forEachIndexed
             label.foreground = if (i == index) UiKit.text else UiKit.subtle
@@ -680,6 +943,27 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
             UiKit.hint(
                 "一个技能 = 一个目录 + 目录里的 SKILL.md（frontmatter 写 name 与 description，正文写步骤）。" +
                     "AI 只会先看到「名字 + 说明」，判断用得上才用 skill 工具取回正文 —— 所以技能再多也不占提示词。"
+            )
+        )
+
+        // ---- 知识库 ----
+        //
+        // 知识库是「跨项目共用的资料库」，和技能一样属于**用户掌管的数据**，
+        // 所以也要摆到设置页里：能看见有多少页、能一键打开目录去放文件。
+        // 只给工具不给入口的话，用户根本不知道要往哪儿放东西 —— 功能等于不存在。
+        form.section("知识库")
+        form.wideRow(kbInfoLabel)
+        val kbButtons = JPanel(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 0)).apply { isOpaque = false }
+        kbButtons.add(UiKit.textButton("打开知识库目录", "把 .md 资料放进去，AI 就能按相关度检索到") {
+            openKbDir()
+        })
+        kbButtons.add(UiKit.textButton("重新扫描", "重新读取知识库目录") { refreshKbInfo() })
+        form.wideRow(kbButtons)
+        form.wideRow(
+            UiKit.hint(
+                "和「搜代码」的区别：搜代码要给出**确切的字符串**，而知识库能按**相关度**找 —— " +
+                    "适合「记得有这回事、但想不起原话」的场景。\n" +
+                    "正文用 # 分小节：小节是检索的最小单位，一个标题下写一件完整的事，检索会准很多。"
             )
         )
 
@@ -796,6 +1080,7 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
             "「仅当前项目」= AI 只能读写当前项目目录内的文件，越界会被拦下并说明原因"
         )
         form.wideRow(showTaskListCheck)
+        form.wideRow(enableSubagentCheck)
         form.wideRow(allowAskUserCheck)
 
         // ---- 长会话 ----
@@ -818,6 +1103,13 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
                 "填 0 = 不限制。模型还没看过的图不受这个限制"
         )
 
+        // **「关于」贴底** —— 中间的空白由这个 glue 吃掉。
+        //
+        // 它同时解决两件事：
+        //   1. 原来「关于」紧跟在设置项后面，下面拖着一大片空白（用户觉得浪费）
+        //   2. 现在那片空白被「关于」自己占住，页面看起来是满的
+        form.glue()
+
         form.section("关于")
         form.row("版本", JBLabel("0.2.0"))
         form.row("平台", JBLabel("Android Studio / IntelliJ 261+"))
@@ -826,7 +1118,10 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
         form.wideRow(UiKit.hint("所有配置都存在本机 IDE 配置目录，不会上传到任何服务器。"))
         form.wideRow(UiKit.hint("API 密钥仅保存在 zhixueyao.xml 中，随 IDE 配置一同管理。"))
 
-        form.finish()
+        // **这里不再调 form.finish()。**
+        // 上面「关于」之前已经有一个 glue 在吃剩余空间了；
+        // 两个 glue 会**平分**那片空白 —— 表现是「关于」只被推到一半，
+        // 下面还漏出一截。一个页面只需要一个。
         return panel
     }
 
@@ -965,9 +1260,27 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
      * 另外会把机器上其他 agent 的技能库（~/.agents/skills 等）也扫出来供参考。
      */
     private fun refreshSkillsInfo() {
+        // 和 refreshKbInfo 同样的毛病：`Skills.all()` 会**扫多个技能目录、
+        // 逐个解析 SKILL.md**，而这里是在 EDT 上同步做的。
+        //
+        // 技能目录可能装着几十个技能（尤其是「外部（只读）」那种指向别人仓库的），
+        // 每次打开设置页全扫一遍 —— 用户没报，是因为他的技能还不多。
         val project = com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
-        val list = com.zhixueyao.agent.Skills.all(project)
+        skillsInfoLabel.text = "正在读取…"
+        skillsInfoLabel.foreground = UiKit.subtle
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            val list = runCatching { com.zhixueyao.agent.Skills.all(project) }.getOrDefault(emptyList())
+            UiKit.ui {
+                renderSkillsInfo(project, list)
+            }
+        }
+    }
 
+    /** 把扫好的技能列表铺到界面上。**必须在 EDT 上跑。** */
+    private fun renderSkillsInfo(
+        project: com.intellij.openapi.project.Project?,
+        list: List<com.zhixueyao.agent.Skills.Skill>
+    ) {
         skillsInfoLabel.text = if (list.isEmpty()) {
             "还没有技能 —— 点「打开技能目录」把技能放进去"
         } else {
@@ -1117,6 +1430,70 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
         skillsPathLabel.revalidate()
         skillsListBody.revalidate()
         skillsListBody.repaint()
+    }
+
+    /**
+     * 刷新知识库状态。
+     *
+     * 只统计**页数与标签数**，不列出全部页 —— 知识库可能几十上百页，
+     * 全列出来会把设置页撑爆，而用户真正需要的是「里面有没有东西」。
+     * （要看具体有什么，用 list_agents 那种思路的工具更合适，这里只做盘面。）
+     */
+    private fun refreshKbInfo() {
+        // **先给一句话，再去后台读。**
+        //
+        // 这里原来是同步的：`KnowledgeBase.allPages()` 会**把知识库目录里的 .md
+        // 全部读出来解析一遍**。而它被三个地方调，**全在 EDT 上**：
+        //   1. 设置页构建时（browse 到这一页就触发）
+        //   2. 「重新扫描」按钮
+        //   3. 「打开知识库目录」之后
+        //
+        // 知识库几十上百页时，每次打开设置页就是一次**在界面线程上的全目录扫描**。
+        // 这是「EDT 上的阻塞 I/O」扫描查出来的 —— 用户还没报，因为他的知识库还小。
+        kbInfoLabel.text = "正在读取…"
+        kbInfoLabel.foreground = UiKit.subtle
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            // 后台只做「读 + 算」，**不碰任何 Swing 组件**
+            val result = runCatching {
+                val pages = com.zhixueyao.tools.KnowledgeBase.allPages()
+                val tags = com.zhixueyao.tools.KnowledgeBase.allTags()
+                Triple(pages.size, tags.size, com.zhixueyao.tools.KnowledgeBase.root().absolutePath)
+            }
+            UiKit.ui {
+                result.onSuccess { (pageCount, tagCount, path) ->
+                    kbInfoLabel.text = if (pageCount == 0) {
+                        "还没有内容 —— 点「打开知识库目录」把 .md 资料放进去"
+                    } else if (tagCount == 0) {
+                        "共 $pageCount 页（$path）"
+                    } else {
+                        "共 $pageCount 页，$tagCount 个标签（$path）"
+                    }
+                    kbInfoLabel.foreground = if (pageCount == 0) UiKit.warn else UiKit.text
+                }.onFailure {
+                    kbInfoLabel.text = "读取知识库失败：" + it.message
+                    kbInfoLabel.foreground = UiKit.warn
+                }
+            }
+        }
+    }
+
+    /** 打开知识库目录（不存在就建出来） */
+    private fun openKbDir() {
+        val dir = com.zhixueyao.tools.KnowledgeBase.root()
+        if (!dir.exists()) dir.mkdirs()
+        // 和 openSkillsDir 走同一条路（Desktop.open）—— 那两个按钮用了很久没出过问题，
+        // 而 Browsers.openInBrowser 在部分平台对目录不生效。
+        // **同一个动作只留一种实现**，免得两个入口行为不一致。
+        runCatching {
+            java.awt.Desktop.getDesktop().open(dir)
+        }.onFailure {
+            com.intellij.openapi.ui.Messages.showInfoMessage(
+                rootPanel,
+                "知识库目录：" + dir.path,
+                "止血药 · 知识库"
+            )
+        }
+        refreshKbInfo()
     }
 
     /**
@@ -1803,13 +2180,24 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
                 alignmentX = java.awt.Component.LEFT_ALIGNMENT
             }
         )
-        listSection.add(Box.createVerticalStrut(4))
+        listSection.add(UiKit.strut(4))
         mcpTable.setShowGrid(false)
         mcpTable.rowHeight = 26
-        mcpTable.columnModel.getColumn(0).preferredWidth = 56
-        mcpTable.columnModel.getColumn(1).preferredWidth = 150
-        mcpTable.columnModel.getColumn(2).preferredWidth = 70
-        mcpTable.columnModel.getColumn(3).preferredWidth = 360
+        // 和「临时会话」那张表同一个毛病：四列全写死，合计 636px，
+        // 设置页窄一点就横向溢出（用户反馈「插件页被挤压了」）。
+        // 同样改成「窄列固定 + 最后一列吸收剩余 + 下限兜底」。
+        mcpTable.autoResizeMode = javax.swing.JTable.AUTO_RESIZE_LAST_COLUMN
+        mcpTable.columnModel.getColumn(0).apply {
+            preferredWidth = 48
+            maxWidth = 48
+        }
+        mcpTable.columnModel.getColumn(1).preferredWidth = 140
+        mcpTable.columnModel.getColumn(2).preferredWidth = 64
+        // 最后一列（描述/工具数这类）自适应；下限 160 保证内容还能读
+        mcpTable.columnModel.getColumn(3).apply {
+            preferredWidth = 300
+            minWidth = 160
+        }
 
         val decorator = ToolbarDecorator.createDecorator(mcpTable)
             .setAddAction {
@@ -1848,7 +2236,7 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
         ioRow.add(UiKit.textButton("导出为 mcp.json") { exportConfig() })
         ioRow.add(UiKit.textButton("测试全部连接") { testAllMcp() })
         ioRow.add(UiKit.textButton("查看已连接工具") { showConnectedTools() })
-        listSection.add(Box.createVerticalStrut(8))
+        listSection.add(UiKit.strut(8))
         listSection.add(ioRow.apply { alignmentX = java.awt.Component.LEFT_ALIGNMENT })
 
         val serverSection = UiKit.roundedCard()
@@ -1897,7 +2285,7 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
         center.layout = BoxLayout(center, BoxLayout.Y_AXIS)
         center.isOpaque = false
         center.add(listSection)
-        center.add(Box.createVerticalStrut(10))
+        center.add(UiKit.strut(10))
         center.add(serverSection.apply { alignmentX = java.awt.Component.LEFT_ALIGNMENT })
         center.add(Box.createVerticalGlue())
         panel.add(center, BorderLayout.NORTH)
@@ -1912,6 +2300,687 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
     }
 
     // ---------------- 表单骨架 ----------------
+
+    /**
+     * 「Git 助手」页。
+     *
+     * ## 这一页要解决的具体问题
+     *
+     * 这台机器的 git 配置里写着 `http.proxy = 127.0.0.1:57567`，
+     * 而那个代理**根本没开**。于是每次推送都在敲一扇没人应的门：
+     *
+     * ```
+     * fatal: unable to access '...': Failed to connect to github.com:443
+     *        over proxy 127.0.0.1 after 2095 ms: Could not connect to server
+     * ```
+     *
+     * 而这个报错**很容易被读成「网络不通」** —— 很可能去查 VPN、查防火墙、
+     * 查 DNS，全查一遍才发现是配置里一个过期的代理地址。
+     *
+     * 所以这一页的核心不是「填个代理地址」，而是**让这件事可检测**：
+     * 点一下就知道当前配置到底通不通、卡在哪一步。
+     *
+     * ## 为什么检测是机械的，不用 AI
+     *
+     * 详见 [com.zhixueyao.git.GitProxyDetector] 的注释。一句话：
+     * **「通没通」有唯一答案，让模型猜只会更慢、更贵、更不准。**
+     * 模型的位置在「检测失败之后**解释原因**」，不在检测本身。
+     */
+    private fun buildGitPage(): JComponent {
+        val form = newForm()
+
+        // **一进来就给个「这是干什么的」的入口。**
+        //
+        // 用户的原话：「总要有一些检测和提醒吧，我建议加个 git 助理说明的按钮，
+        // 用来展示 git 助理所有功能的详细介绍」。
+        //
+        // 他点中的问题：这一页全是「状态」和「开关」，**没有一处说清这东西是干什么的**。
+        // 于是用户看到一个「启用 Git 助手」的开关时，没法判断该不该打开 ——
+        // 因为他不知道打开之后会发生什么。而试错成本可能是「AI 拿我的仓库乱搞」。
+        form.wideRow(
+            JBPanel<JBPanel<*>>(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 8, 0)).apply {
+                isOpaque = false
+                add(UiKit.textButton("Git 助手说明") {
+                    try {
+                        GitHelpDialog(ProjectManager.getInstance().openProjects.firstOrNull()).show()
+                    } catch (t: Throwable) {
+                        com.intellij.openapi.ui.Messages.showInfoMessage(
+                            rootPanel, "打不开说明窗口：" + (t.message ?: t.javaClass.simpleName), "止血药"
+                        )
+                    }
+                })
+                add(UiKit.hint("它做什么、不做什么、每一项设置怎么选 —— 都在里面"))
+            }
+        )
+
+        form.section("启用")
+        form.wideRow(gitEnabledCheck)
+        form.hintRow(
+            UiKit.hint(
+                "关掉时插件不碰任何 git 设置，也不给 git 命令加参数 —— " +
+                    "相当于没装过这个功能。"
+            )
+        )
+
+        form.section("访问方式")
+        gitModeDirect.toolTipText = "不走代理。会**显式清掉** git 配置里残留的代理（那正是常见故障源）"
+        gitModeProxy.toolTipText = "手填一个代理地址，例如 http://127.0.0.1:7890"
+        gitModeVpn.toolTipText = "扫描本机常见代理端口，自动认出来 —— VPN 换端口也不用改设置"
+
+        // 每个选项**自带一句「什么时候选它」**，而不是只写个名字。
+        //
+        // 用户的原话：「这个访问方式怎么弄都没有说明」。
+        // 第一版我只给了 toolTipText —— 那要**鼠标悬停才出现**，
+        // 而且没人会想到去悬停一个单选按钮。**看得见的说明才算说明。**
+        gitModeDirect.toolTipText = "不走代理"
+        gitModeProxy.toolTipText = "手填代理地址"
+        gitModeVpn.toolTipText = "自动扫端口"
+
+        val modeRow = JBPanel<JBPanel<*>>(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 16, 0)).apply {
+            isOpaque = false
+            alignmentX = java.awt.Component.LEFT_ALIGNMENT
+            add(gitModeDirect); add(gitModeProxy); add(gitModeVpn)
+        }
+        javax.swing.ButtonGroup().apply {
+            add(gitModeDirect); add(gitModeProxy); add(gitModeVpn)
+        }
+        form.wideRow(modeRow)
+
+        // **跟着选项变的说明。**
+        //
+        // 比在每个选项旁边写一小句更有效：选项多起来时旁边写不下，
+        // 而这里可以写整段 —— 包括「怎么判断自己属于哪种」这种真正有用的信息。
+        form.wideRow(gitModeHelp)
+
+        // 代理地址（仅「自定义代理」时可见）
+        gitProxyField.columns = 28
+        gitProxyField.emptyText.text = "http://127.0.0.1:7890"
+        val proxyBefore = form.panel.componentCount
+        form.row("代理地址", gitProxyField, "形如 http://主机:端口；不填 http:// 也能认")
+        gitProxyRow.addAll(form.panel.components.drop(proxyBefore).toList())
+
+        // VPN 端口（仅「本地 VPN 工具」时可见）
+        gitVpnPortField.columns = 10
+        gitVpnPortField.emptyText.text = "留空 = 自动检测"
+        val vpnBefore = form.panel.componentCount
+        form.row("VPN 端口", gitVpnPortField, "留空则自动扫描常见端口（推荐）")
+        gitVpnRow.addAll(form.panel.components.drop(vpnBefore).toList())
+        // 这一条是用户实测之后补的 —— 见下面的说明。
+        form.hintRow(
+            UiKit.hint(
+                "**注意：只有「本地开代理端口」的客户端才适用。**\n" +
+                    "Clash / v2rayN / Clash Verge 这类会在本机开一个 HTTP 代理端口" +
+                    "（7890 / 10809 / 7897 等），能扫到。\n" +
+                    "而一键加速类客户端（如 FastConnect、绝大多数手机搬过来的 VPN）走的是" +
+                    "**全局 TUN 模式** —— 它直接把系统流量接管了，**本机没有代理端口可以扫**。\n" +
+                    "**后者请选「直连」**：流量已经被它接管，再配代理反而绕一圈。"
+            )
+        )
+
+        val testBtn = UiKit.primaryButton("测试连接") { runGitSelfTest() }
+        val testRow = JBPanel<JBPanel<*>>(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 8, 0)).apply {
+            isOpaque = false
+            alignmentX = java.awt.Component.LEFT_ALIGNMENT
+            add(testBtn)
+            add(gitStatusLabel)
+        }
+        form.wideRow(testRow)
+        form.hintRow(
+            UiKit.hint(
+                "「测试连接」做的事：先找到代理 → 再确认它确实是个 HTTP 代理 → " +
+                    "最后用它真的去连一次 github.com。三步都过才算通。"
+            )
+        )
+
+        form.section("账号（决定「能不能推上去」）")
+        gitUserField.columns = 24
+        gitUserField.emptyText.text = "GitHub 登录名，例如 afxpy"
+        form.row("用户名", gitUserField, "GitHub 的登录名。不是秘密，可以直接存")
+        form.hintRow(
+            UiKit.hint(
+                "这一节是**凭它进门**的东西：用户名 + Token 一起用来向 GitHub 证明「你是你」。\n" +
+                    "填错或没填 → 推送会被拒绝。"
+            )
+        )
+
+        gitTokenField.columns = 24
+        form.row("Token", gitTokenField, "个人访问令牌。会加密存进系统凭据管理器，不落明文")
+
+        // 获取入口 —— 用户提的：光说「填 Token」而不给去哪儿拿，等于让人自己摸。
+        //
+        // 做成一排链接：点开就是浏览器对应的页面，省掉「搜一下 github token 在哪」这一步。
+        // 顺带把**该勾哪些权限**写清楚 —— GitHub 的 token 权限页有十几项，
+        // 全勾了权限过大（等于给了整个账号），不勾又推不上去。
+        val tokenLinks = JBPanel<JBPanel<*>>(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 10, 0)).apply {
+            isOpaque = false
+            alignmentX = java.awt.Component.LEFT_ALIGNMENT
+            add(UiKit.linkLabel("① 去 GitHub 创建 Token →") {
+                browse("https://github.com/settings/tokens/new?scopes=repo&description=Android%20Studio%20%E6%AD%A2%E8%A1%80%E8%8D%AF")
+            })
+            // **两个链接必须落在同一个 token 类型上。**
+            // 用户反馈：创建那个进的是「代币（经典）」，查看那个进的是「细粒度令牌」——
+            // 两边不一致，进去找不着刚建的那个。
+            // `?type=classic` 显式钉住经典类型。
+            add(UiKit.linkLabel("查看已有 Token") {
+                browse("https://github.com/settings/tokens?type=classic")
+            })
+        }
+        form.wideRow(tokenLinks)
+        form.hintRow(
+            UiKit.hint(
+                "上面那个链接已经把权限预勾好了（**只勾 repo**，够推送用）。\n" +
+                    "**别勾全选** —— Token 的权限等于账号的权限，给多了泄露时损失更大。\n" +
+                    "生成后那串 `ghp_...` 只显示一次，复制过来粘到上面即可。"
+            )
+        )
+
+        // 提交署名。和上面的「认证」是两件事 —— **用户问过这个区别**，
+        // 所以这里不是一句话带过，而是把两者的关系讲清楚。
+        // ---------------- Git 环境自检 ----------------
+        //
+        // 用户的原话：「我都感觉可以直接内置脚本不需要 ai 了都直接就是填好信息
+        // 检查设备环境配置等」。
+        //
+        // **他说得对，而且这纠正了我一直以来的做法**：我给了三个文本框让他填，
+        // 但新用户**根本不知道自己缺什么** —— 填表的前提是「先知道要填什么」。
+        // 自检把这件事反过来：**我来查，查完告诉你、并给你修**。
+        //
+        // 这些检查没有一项需要 AI（git 装没装、署名配没配、有没有凭据管理器、
+        // 连不连得上、配置里有没有残留代理）—— 全是有唯一答案的问题。
+        // 和「VPN 检测不该用 AI」是同一条判据。
+        form.section("环境自检")
+        val recheckBtn = UiKit.textButton("重新检查") { runEnvCheck() }
+        val envHead = JBPanel<JBPanel<*>>(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 8, 0)).apply {
+            isOpaque = false
+            alignmentX = java.awt.Component.LEFT_ALIGNMENT
+            add(recheckBtn)
+            add(UiKit.hint("每项都是本地命令，几秒出结果。不需要联网服务。"))
+        }
+        form.wideRow(envHead)
+        form.wideRow(gitEnvBody)
+
+        // **没配署名时才展开输入框。**
+        //
+        // 之前是无条件显示两个框让用户填 —— 而绝大多数人早就配过了
+        // （用户的原话：「我们本地提交到存储库里面都是要填写 github 所填写的名称和邮箱」，
+        // 实测这台机器上确实已经配好了）。
+        // 但对**新用户**又不能不给入口 —— 所以「有问题才显示」。
+        val authorFix = JBPanel<JBPanel<*>>(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 8, 0)).apply {
+            isOpaque = false
+            alignmentX = java.awt.Component.LEFT_ALIGNMENT
+            gitAuthorNameField2.columns = 14
+            gitAuthorNameField2.emptyText.text = "GitHub 上的名字"
+            gitAuthorEmailField2.columns = 20
+            gitAuthorEmailField2.emptyText.text = "GitHub 注册邮箱"
+            add(gitAuthorNameField2)
+            add(gitAuthorEmailField2)
+            add(UiKit.textButton("写进 git 全局配置") {
+                val n = gitAuthorNameField2.text.trim()
+                val e = gitAuthorEmailField2.text.trim()
+                if (n.isBlank() || e.isBlank()) {
+                    com.intellij.openapi.ui.Messages.showInfoMessage(
+                        rootPanel, "名字和邮箱都要填 —— 缺一个 git 提交会失败。", "设置署名"
+                    )
+                } else {
+                    val ok = com.zhixueyao.git.GitIdentity.setGlobal(n, e)
+                    if (ok) {
+                        com.intellij.openapi.ui.Messages.showInfoMessage(
+                            rootPanel, "已写入全局 git 配置：\n  user.name  = $n\n  user.email = $e",
+                            "设置署名"
+                        )
+                        runEnvCheck()
+                    } else {
+                        com.intellij.openapi.ui.Messages.showInfoMessage(
+                            rootPanel,
+                            "写入失败。可以自己在终端执行：\n" +
+                                "git config --global user.name \"$n\"\n" +
+                                "git config --global user.email \"$e\"",
+                            "设置署名"
+                        )
+                    }
+                }
+            })
+        }
+        form.wideRow(authorFix)
+        gitAuthorFixRow = authorFix
+        // **初始隐藏。** 原来是默认可见 —— 于是「署名填好」的用户也会看到
+        // 两个空输入框摆在「环境自检」下面，像是要他填什么。
+        // 它应该只在自检发现署名没配时才出现（`needAuthorFix` 控制）。
+        authorFix.isVisible = false
+
+        val tokenRow = JBPanel<JBPanel<*>>(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 8, 0)).apply {
+            isOpaque = false
+            alignmentX = java.awt.Component.LEFT_ALIGNMENT
+            // **凭据操作一律丢后台。**
+            //
+            // 用户报「保存到加密存储没反应」—— 因为这里原来直接在 EDT 上
+            // 调了 PasswordSafe，而它要走系统凭据管理器（真实 I/O）。
+            // 那一步一慢，**整个 EDT 就卡住**，于是连「环境自检」的结果
+            // 都回不来（invokeLater 排在后面永远轮不到）。
+            //
+            // 现在：点一下先给「正在保存…」，后台做完再回报结果。
+            add(UiKit.textButton("保存到加密存储") {
+                val u = gitUserField.text.trim()
+                val t = String(gitTokenField.password)
+                gitTokenStatusLabel.text = "正在保存…"
+                gitTokenStatusLabel.foreground = UiKit.subtle
+                com.intellij.openapi.application.ApplicationManager.getApplication()
+                    .executeOnPooledThread {
+                        val ok = com.zhixueyao.git.GitCredentials.save(u, t)
+                        UiKit.ui {
+                                gitTokenStatusLabel.text =
+                                    if (ok) "已保存" else "保存失败（系统凭据管理器不可用或超时）"
+                                gitTokenStatusLabel.foreground =
+                                    if (ok) UiKit.subtle else UiKit.danger
+                            }
+                    }
+            })
+            add(UiKit.textButton("清除") {
+                gitTokenStatusLabel.text = "正在清除…"
+                com.intellij.openapi.application.ApplicationManager.getApplication()
+                    .executeOnPooledThread {
+                        com.zhixueyao.git.GitCredentials.clear()
+                        UiKit.ui {
+                                gitTokenField.text = ""
+                                gitTokenStatusLabel.text = "已清除"
+                                gitTokenStatusLabel.foreground = UiKit.subtle
+                            }
+                    }
+            })
+            add(gitTokenStatusLabel)
+        }
+        form.wideRow(tokenRow)
+        form.hintRow(
+            UiKit.hint(
+                "Token 存在操作系统的凭据管理器里（Windows 凭据管理器 / macOS 钥匙串），" +
+                    "**加密且按用户隔离** —— 和配置文件里那些明文密钥不是一回事。"
+            )
+        )
+
+        // 模式切换时，把不适用的输入框藏起来 —— 免得用户对着灰色的框猜「该填哪个」
+        gitModeDirect.addActionListener { refreshGitVisibility() }
+        gitModeProxy.addActionListener { refreshGitVisibility() }
+        gitModeVpn.addActionListener { refreshGitVisibility() }
+        gitEnabledCheck.addActionListener { refreshGitVisibility() }
+
+        // **收尾必须调 finish()**：它加一个 weighty=1 的 VerticalGlue，
+        // 让 GridBagLayout 把内容**靠上排布**。
+        // 少了它，内容会被垂直居中/拉伸 —— 而这一页内容少，看起来就是「一片空白」。
+        // 其他三个页面都有这一句，我第一版漏了。
+        form.finish()
+        return form.panel
+    }
+
+    /** 按当前模式和总开关，决定哪些行该露出来 */
+    private fun refreshGitVisibility() {
+        val on = gitEnabledCheck.isSelected
+        val m = currentGitMode()
+
+        // **整个模式相关的整块都显示/隐藏，而不是只置灰。**
+        //
+        // 第一版是把不相关的输入框设成 disabled —— 理由是「隐藏会让高度跳变」。
+        // 但用户看到的是一堆灰框，**反而更困惑**：不知道哪些要填、哪些是摆设。
+        // 「高度稳定」在「看不懂」面前不值一提。
+        gitProxyRow.forEach { it.isVisible = on && m == "proxy" }
+        gitVpnRow.forEach { it.isVisible = on && m == "vpn" }
+
+        gitUserField.isEnabled = on
+        gitTokenField.isEnabled = on
+        if (!on) gitStatusLabel.text = ""
+
+        // 模式说明跟着选中的选项走
+        gitModeHelp.text = if (!on) "" else when (m) {
+            "proxy" -> "<html><font color='gray'>走你填的代理。适合：<b>知道代理端口</b>的情况 " +
+                "（Clash / v2rayN 的界面里能看到端口号，常见 7890 / 10809）。</font></html>"
+            "vpn" -> "<html><font color='gray'>自动扫描本机端口找出代理。适合：" +
+                "<b>客户端确实开了本地端口、但你不知道是哪个</b>的情况。<br>" +
+                "如果你的加速器是<b>全局 / TUN 模式</b>（FastConnect 等一键加速类），" +
+                "它<b>不提供本地端口</b> —— 那种情况请选「直连」。</font></html>"
+            else -> "<html><font color='gray'>不走代理，直连。" +
+                "<b>如果你的加速器是全局模式，选这个就对了</b> —— " +
+                "它已经接管了系统流量，再配代理反而绕一圈。<br>" +
+                "插件会同时<b>清掉 git 配置里残留的代理</b>" +
+                "（那是「明明有网却推不上去」的常见原因）。</font></html>"
+        }
+
+        // **token 状态改成异步查。**
+        //
+        // 原来这里是 `GitCredentials.hasToken()` —— 同步、在 EDT 上、
+        // 而它在 `reset()` 里被调用，于是**设置页一打开就去碰系统凭据管理器**。
+        // 那一步一卡，整页就没反应了。
+        //
+        // 现在先显示「查询中…」，后台查完再改文字。用户看到的是一个
+        // 短暂的「查询中」，而不是整个页面假死。
+        gitTokenStatusLabel.text = "查询中…"
+        gitTokenStatusLabel.foreground = UiKit.subtle
+        val tokStart = System.currentTimeMillis()
+        com.intellij.openapi.application.ApplicationManager.getApplication()
+            .executeOnPooledThread {
+                // 即使 hasToken 内部有超时（3 秒），这里再包一层 try ——
+                // 后台一抛异常，下面那句 invokeLater 就永远不执行，
+                // 界面会永远停在「查询中…」而**不报任何错**。
+                val has = try {
+                    com.zhixueyao.git.GitCredentials.hasToken()
+                } catch (t: Throwable) {
+                    false
+                }
+                val tokMs = System.currentTimeMillis() - tokStart
+                UiKit.ui {
+                        gitTokenStatusLabel.text = if (has) {
+                            "已保存（查询用时 ${tokMs} ms）"
+                        } else {
+                            "未保存（查询用时 ${tokMs} ms）"
+                        }
+                        gitTokenStatusLabel.foreground = UiKit.subtle
+                    }
+            }
+        rootPanel?.revalidate()
+        rootPanel?.repaint()
+    }
+
+    /**
+     * 跑一遍 Git 环境自检，把结果铺到界面上。
+     *
+     * 每行 = 一个 ✓/!/✗ + 标题 + 说明 + （如果能修）一个修复按钮。
+     * **能看到「缺什么」和「怎么补」，用户就不用自己去搜了。**
+     */
+    private fun runEnvCheck() {
+        val dir = com.intellij.openapi.project.ProjectManager.getInstance()
+            .openProjects.firstOrNull()?.basePath?.let { java.io.File(it) }
+        gitEnvBody.removeAll()
+        // **把「开始」和「结束」都写进界面** —— 这样才能区分两种失败：
+        //  - 一直停在「正在检查…」→ 后台没回来（或者结果没回到 EDT）
+        //  - 出现了结果行但没内容 → 是渲染的问题
+        envStartedAt = System.currentTimeMillis()
+        gitEnvBody.add(UiKit.hint("正在检查…（若超过 15 秒未变，请看下方诊断）"))
+        gitEnvBody.revalidate()
+
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            // **后台块必须整个包住。**
+            //
+            // 用户报「重新检查了几分钟没有完成」—— 界面上永远是「正在检查…」。
+            // 原因就是这里少了个 try：**后台一抛异常，下面的 invokeLater 就永远不执行**，
+            // 界面停在一句「正在检查…」上，而且**不报任何错**。
+            //
+            // 这个形状很难查：症状是「没反应」，而原因藏在后台线程的堆栈里 ——
+            // 用户看不到，日志里也只有一行。**所以宁可显示一条丑一点的错误，
+            // 也不要留一个安静的「正在…」。**
+            val results = try {
+                com.zhixueyao.git.GitEnvironment.check(dir)
+            } catch (t: Throwable) {
+                UiKit.ui {
+                    gitEnvBody.removeAll()
+                    gitEnvBody.add(envErrorRow("检查失败：" + (t.message ?: t.javaClass.simpleName), t))
+                    gitEnvBody.revalidate()
+                    gitEnvBody.repaint()
+                    rootPanel?.revalidate()
+                }
+                return@executeOnPooledThread
+            }
+            UiKit.ui {
+                gitEnvBody.removeAll()
+                val elapsed = System.currentTimeMillis() - envStartedAt
+                gitEnvBody.add(UiKit.hint("检查完成，用时 ${elapsed} ms。构建版本：$BUILD_STAMP"))
+                var needAuthorFix = false
+                for (c in results) {
+                    val mark = when (c.level) {
+                        com.zhixueyao.git.GitEnvironment.Level.OK -> "✓"
+                        com.zhixueyao.git.GitEnvironment.Level.WARN -> "!"
+                        else -> "✗"
+                    }
+                    val color = when (c.level) {
+                        com.zhixueyao.git.GitEnvironment.Level.OK -> UiKit.subtle
+                        com.zhixueyao.git.GitEnvironment.Level.WARN -> UiKit.warn
+                        else -> UiKit.danger
+                    }
+                    // **按钮跟在文字后面，不顶到最右边。**
+                    //
+                    // 原来是 BorderLayout，按钮扔进 EAST —— 于是它被推到
+                    // 面板最右侧，和它要操作的那条说明**隔着大半屏**。
+                    // 用户看到的是「一行说明 + 远处一个孤零零的按钮」，
+                    // 根本看不出它们是一起的。
+                    //
+                    // 改成一列：第一行是检查项文字，第二行是按钮（左对齐）。
+                    val row = JBPanel<JBPanel<*>>().apply {
+                        layout = javax.swing.BoxLayout(this, javax.swing.BoxLayout.Y_AXIS)
+                        isOpaque = false
+                        alignmentX = java.awt.Component.LEFT_ALIGNMENT
+                        border = JBUI.Borders.empty(3, 0, 3, 0)
+                    }
+                    row.add(
+                        com.intellij.ui.components.JBLabel(
+                            "<html><div style='width:640px'>" +
+                                "<font color='${if (c.level == com.zhixueyao.git.GitEnvironment.Level.OK) "gray" else "#c0392b"}'>" +
+                                "<b>$mark ${c.title}</b></font>　" +
+                                "<font color='gray'>${c.detail.replace("<", "&lt;")}</font></div></html>"
+                        ).apply { alignmentX = java.awt.Component.LEFT_ALIGNMENT }
+                    )
+                    fixFor(c)?.let {
+                        it.alignmentX = java.awt.Component.LEFT_ALIGNMENT
+                        row.add(javax.swing.Box.createVerticalStrut(2))
+                        row.add(it)
+                    }
+                    gitEnvBody.add(row)
+                    // 每项之间留一点间距，避免挤成一坨
+                    gitEnvBody.add(javax.swing.Box.createVerticalStrut(6))
+
+                    // **原始信息：命令 + 输出。** 只在不通过时显示 ——
+                    // 正常时铺一堆命令会淹没重点，出问题时它才是最有用的东西。
+                    if (c.level != com.zhixueyao.git.GitEnvironment.Level.OK && c.raw != null) {
+                        gitEnvBody.add(
+                            com.intellij.ui.components.JBLabel(
+                                "<html><pre style='font-size:9px;color:gray'>" +
+                                    c.raw.replace("<", "&lt;") + "</pre></html>"
+                            ).apply {
+                                alignmentX = java.awt.Component.LEFT_ALIGNMENT
+                                border = JBUI.Borders.empty(0, 16, 4, 0)
+                            }
+                        )
+                    }
+                    if (c.fixKind == com.zhixueyao.git.GitEnvironment.FixKind.EDIT_AUTHOR) needAuthorFix = true
+                }
+                // 署名那一行只在有问题时露出来
+                gitAuthorFixRow?.isVisible = needAuthorFix
+                gitEnvBody.revalidate()
+                gitEnvBody.repaint()
+                rootPanel?.revalidate()
+            }
+        }
+    }
+
+    /** 自检崩了时显示的一行 —— 带上堆栈前几行，让用户能直接把它念出来 */
+    private fun envErrorRow(msg: String, t: Throwable): JComponent =
+        com.intellij.ui.components.JBLabel(
+            "<html><font color='#c0392b'><b>✗ $msg</b></font><br>" +
+                "<font color='gray'>这不影响其它设置。把下面这段发出来就能定位：</font>" +
+                "<pre style='font-size:9px'>" +
+                t.stackTrace.take(4).joinToString("\n") { "at $it" }.replace("<", "&lt;") +
+                "</pre></html>"
+        ).apply { alignmentX = java.awt.Component.LEFT_ALIGNMENT }
+
+    /** 按检查项的 fixKind 给一个修复按钮；没有可修的返回 null */
+    private fun fixFor(c: com.zhixueyao.git.GitEnvironment.Check): JComponent? {
+        val label = c.fixLabel ?: return null
+        // 先声明、后赋值，让下面的 onClick 闭包能拿到这个按钮 ——
+        // 要改它的文字和可用状态（「正在安装…」+ 置灰），
+        // 否则用户点了之后几十秒里没有任何反馈，会以为没点上。
+        lateinit var btn: JComponent
+        btn = UiKit.textButton(label) {
+            when (c.fixKind) {
+                com.zhixueyao.git.GitEnvironment.FixKind.CLEAR_PROXY -> {
+                    val ok = com.zhixueyao.git.GitEnvironment.clearProxy(null)
+                    com.intellij.openapi.ui.Messages.showInfoMessage(
+                        rootPanel,
+                        if (ok) "已清掉配置里的代理。\n\n注意：这只影响插件看到的 git 配置。" +
+                            "如果那个代理还在用，请自己在终端重新配。"
+                        else "没清掉，可能要手动执行：\n${c.fixCommand.orEmpty()}",
+                        "清除代理配置"
+                    )
+                    runEnvCheck()
+                }
+                com.zhixueyao.git.GitEnvironment.FixKind.INSTALL_GCM -> {
+                    // 安装要下载/装包，**必须放后台** —— 它会跑几十秒
+                    (btn as? javax.swing.JButton)?.apply {
+                        isEnabled = false
+                        text = "正在安装…"
+                    }
+                    com.intellij.openapi.application.ApplicationManager.getApplication()
+                        .executeOnPooledThread {
+                            val (ok, msg) = com.zhixueyao.git.GitEnvironment.installGcm()
+                            com.intellij.openapi.application.ApplicationManager.getApplication()
+                                .invokeLater(
+                                    {
+                                        (btn as? javax.swing.JButton)?.apply {
+                                            isEnabled = true
+                                            text = "自动安装"
+                                        }
+                                        com.intellij.openapi.ui.Messages.showInfoMessage(
+                                            rootPanel, msg,
+                                            if (ok) "安装完成" else "安装失败"
+                                        )
+                                        // 装完如果找到了，顺手启用 —— 用户点一次就全好了
+                                        if (ok) {
+                                            val (eok, emsg) = com.zhixueyao.git.GitEnvironment.enableGcm()
+                                            if (eok) {
+                                                com.intellij.openapi.ui.Messages.showInfoMessage(
+                                                    rootPanel, emsg, "已同时启用"
+                                                )
+                                            }
+                                        }
+                                        runEnvCheck()
+                                    },
+                                    com.intellij.openapi.application.ModalityState.any()
+                                )
+                        }
+                }
+                com.zhixueyao.git.GitEnvironment.FixKind.ENABLE_GCM -> {
+                    val (ok, msg) = com.zhixueyao.git.GitEnvironment.enableGcm()
+                    com.intellij.openapi.ui.Messages.showInfoMessage(
+                        rootPanel, msg, if (ok) "凭据管理器已启用" else "启用失败"
+                    )
+                    runEnvCheck()
+                }
+                com.zhixueyao.git.GitEnvironment.FixKind.OPEN_GCM_PAGE ->
+                    browse("https://github.com/git-ecosystem/git-credential-manager/releases/latest")
+                com.zhixueyao.git.GitEnvironment.FixKind.OPEN_GIT_PAGE ->
+                    browse("https://git-scm.com/downloads")
+                com.zhixueyao.git.GitEnvironment.FixKind.EDIT_AUTHOR -> {
+                    // 展开输入框并滚到它
+                    gitAuthorFixRow?.isVisible = true
+                    rootPanel?.revalidate()
+                }
+                else -> {}
+            }
+        }
+        return btn
+    }
+
+    /** 用系统默认浏览器打开一个链接。打不开时**如实提示**，不静默。 */
+    private fun browse(url: String) {
+        val ok = runCatching {
+            java.awt.Desktop.getDesktop().browse(java.net.URI(url))
+        }.isSuccess
+        if (!ok) {
+            com.intellij.openapi.ui.Messages.showInfoMessage(
+                rootPanel, "打不开浏览器，请手动访问：\n$url", "打开链接"
+            )
+        }
+    }
+
+    /** 当前选中的访问方式 */
+    private fun currentGitMode(): String = when {
+        gitModeProxy.isSelected -> "proxy"
+        gitModeVpn.isSelected -> "vpn"
+        else -> "direct"
+    }
+
+    /**
+     * 自检：从「当前设置」出发，一步步验证到「能不能真的连上 GitHub」。
+     *
+     * 刻意**做一个长流程**而不是一个布尔判断 —— 因为它要回答的不是「通不通」，
+     * 而是「**卡在哪一步**」。用户看到「端口 7890 开着但不是代理」和看到
+     * 「连不上」是完全不同的两种信息：前者去改端口，后者去查 VPN。
+     */
+    private fun runGitSelfTest() {
+        val mode = currentGitMode()
+        gitStatusLabel.foreground = UiKit.subtle
+        // **说清要等多久。** 原来是干巴巴的「正在检测…」——
+        // 扫十几个端口加一次目标站连接，最多要十几秒，
+        // 用户不知道是在跑还是卡死了（他原话：「检测很久都没反应」）。
+        gitStatusLabel.text = when (mode) {
+            "vpn" -> "正在检测…（要扫一圈本机端口，最多十几秒）"
+            "proxy" -> "正在检测…"
+            else -> "正在检测…（要连一次 github）"
+        }
+
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            // 同 runEnvCheck：**不包住就会留一句永远不变的「正在检测…」**
+            val (text, ok) = try {
+                when (mode) {
+                    "proxy" -> testOneProxy(gitProxyField.text.trim())
+                    "vpn" -> testVpnMode()
+                    else -> "直连模式：不经过代理。" to true
+                }
+            } catch (t: Throwable) {
+                ("检测失败：" + (t.message ?: t.javaClass.simpleName)) to false
+            }
+
+            // 直连模式下再往前走一步 —— 真的连一次 github，别只报「设置了直连」
+            //
+            // （这里原来还有一行 `val r = testThroughProxy("http://127.0.0.1:1")`，
+            //   **r 从没被用过** —— 一次白跑的网络调用。已删。）
+            val finalPair = if (mode == "direct" && ok) {
+                val reachable = try {
+                    directReachable()
+                } catch (t: Throwable) {
+                    false
+                }
+                if (reachable) "直连模式：不走代理，能连上 github" to true
+                else "直连模式：不走代理，但连不上 github（可能是网络本身的问题）" to false
+            } else text to ok
+
+            UiKit.ui {
+                gitStatusLabel.text = finalPair.first
+                gitStatusLabel.foreground = if (finalPair.second) UiKit.subtle else UiKit.danger
+            }
+        }
+    }
+
+    /** 验一个具体的代理地址：是不是代理 + 能不能真的走过去 */
+    private fun testOneProxy(url: String): Pair<String, Boolean> {
+        if (url.isBlank()) return "请先填代理地址" to false
+        val port = com.zhixueyao.git.GitProxyDetector.parsePort(url)
+            ?: return "地址看不懂：$url（应该是 http://127.0.0.1:7890 这种）" to false
+
+        val p = com.zhixueyao.git.GitProxyDetector.probeHttpProxy(port)
+        if (!p.ok) return "端口 $port：${p.detail}" to false
+        val t = com.zhixueyao.git.GitProxyDetector.testThroughProxy(url)
+        return t.detail to t.ok
+    }
+
+    /** VPN 模式：扫一圈，报告「试了哪些、结果如何」 */
+    private fun testVpnMode(): Pair<String, Boolean> {
+        val explicit = gitVpnPortField.text.trim().toIntOrNull()
+        val d = com.zhixueyao.git.GitProxyDetector.detectLocalProxy(
+            extraPorts = if (explicit != null && explicit > 0) listOf(explicit) else emptyList()
+        )
+        if (!d.found) {
+            // **把扫过哪些端口列出来。** 只报「没找到」会让用户怀疑是不是没执行，
+            // 而这个功能恰恰是要**消除不确定感**的。
+            val tried = d.scanned.take(6).joinToString("、") { "${it.port}(${it.detail})" }
+            return "没找到可用的本地代理。已试：$tried" to false
+        }
+        val t = com.zhixueyao.git.GitProxyDetector.testThroughProxy(d.proxyUrl!!)
+        return "找到代理 ${d.proxyUrl}；${t.detail}" to t.ok
+    }
+
+    /** 不走代理能不能连上 github —— 用系统 DNS + 直连，给「直连模式」一个真实结论 */
+    private fun directReachable(): Boolean = runCatching {
+        java.net.Socket().use { s ->
+            s.connect(java.net.InetSocketAddress("github.com", 443), 8000)
+            true
+        }
+    }.getOrDefault(false)
 
     private class FormBuilder(val panel: JBPanel<JBPanel<*>>) {
         private val gbc = GridBagConstraints().apply {
@@ -1959,6 +3028,27 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
         }
 
         /** 收尾：底部留白，让内容靠上排布 */
+        /**
+         * 加一段**可被拉伸**的空白，把后面的内容推到底部。
+         *
+         * 用在「关于」这类「应该贴底」的小节之前：
+         * 上面是设置项，下面吊着版本信息，中间的空白由它吃掉 ——
+         * **那片空白就从「页面没填满」变成了「有意的间隔」。**
+         *
+         * 用户的原话：「留到的空间不存储内容属实浪费，所以还不如去掉这一大空白空间，
+         * 让关于做底部」。
+         */
+        fun glue() {
+            gbc.gridy = row; gbc.gridx = 0; gbc.weighty = 1.0; gbc.gridwidth = 2
+            panel.add(Box.createVerticalGlue(), gbc)
+            row++
+            // **关键：用完把 weighty 清掉。**
+            // 不清的话后面每个组件都会跟着分剩余空间，那些行会被撑开
+            //（表现是「行与行之间莫名其妙有空隙」）。
+            gbc.weighty = 0.0
+            gbc.gridwidth = 1
+        }
+
         fun finish() {
             gbc.gridy = row; gbc.gridx = 0; gbc.weighty = 1.0; gbc.gridwidth = 2
             panel.add(Box.createVerticalGlue(), gbc)
@@ -2313,6 +3403,7 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
             Triple("model", "模型", AllIcons.General.InspectionsOK),
             Triple("plugins", "插件", AllIcons.General.Web),
             Triple("presets", "Agent 预设", AllIcons.General.InspectionsEye),
+            Triple("git", "Git 助手", AllIcons.Vcs.Branch),
             Triple("temp", "临时会话", AllIcons.Actions.GC)
         )
 

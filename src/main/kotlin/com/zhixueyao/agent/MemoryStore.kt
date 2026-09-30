@@ -118,7 +118,7 @@ object MemoryStore {
             val today = LocalDate.now().format(DateTimeFormatter.ISO_DATE)
             val keep = (existing + Entry(today, clean))
                 .takeLast(MAX_ENTRIES)   // 超上限丢最旧的
-            file.writeText(render(keep), Charsets.UTF_8)
+            com.zhixueyao.util.AtomicFiles.write(file, render(keep))
             null
         }.getOrElse { "写入失败：${it.message}" }
     }
@@ -130,7 +130,7 @@ object MemoryStore {
             it.text.contains(keyword, ignoreCase = true)
         }
         if (remained.size == existing.size) return 0
-        file.writeText(render(remained), Charsets.UTF_8)
+        com.zhixueyao.util.AtomicFiles.write(file, render(remained))
         existing.size - remained.size
     }.getOrDefault(0)
 

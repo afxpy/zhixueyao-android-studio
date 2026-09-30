@@ -15,11 +15,11 @@ Android Studio 2026.1.3 的编程助手插件（IntelliJ Platform 261+）。
 
 | 用途 | 路径 |
 |---|---|
-| 工程根 | `<工程根>` |
+| 工程根 | `C:/Users/16956/WorkBuddy/2026-09-26-00-00-18/zhixueyao` |
 | 编译平台 | `D:/Android studio`（local 依赖，不下载 IDE 发行包） |
 | JDK | `D:/tools/jdk-21.0.5+11` |
 | 安装目标 | `%APPDATA%/Google/AndroidStudio2026.1.3/plugins/zhixueyao/lib/zhixueyao-0.2.0.jar` |
-| 离线探针 | `<本机临时探针目录>/`（**不放进工程**） |
+| 离线探针 | `C:/Users/16956/AppData/Local/Temp/zx-probe/`（**不放进工程**） |
 | 工程日志 | `.workbuddy/memory/2026-09-26.md` |
 
 ## 源码结构（看改哪里）

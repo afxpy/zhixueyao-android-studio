@@ -1,54 +1,20 @@
-"""
-扫「只挂一次的回调捕获了会变的值」。
-
-用法：
-    python scan_captures.py [要扫的目录]
-    默认扫 src/main/kotlin/com/zhixueyao/ui
-
-## 为什么是这个口径（实测数据支撑）
-
-第一版按最初的设想写成了「扫所有 lambda / 匿名类」，规模是：
-
-    ui/ 下函数总数                  349
-    有回调注册的函数（宽口径）        27    回调注册点 42 处
-    其中「只挂一次」的（窄口径）       1    守卫点 2 处
-    → 口径收窄压掉 96%
-
-宽口径下**几乎每个带交互的函数都会被卷进来**（按钮、列表、输入框都会挂监听），
-人工过一遍不现实；窄口径只剩 1 个函数，过一遍是几秒的事。
-
-## 判据：三个条件同时成立才算可疑
-
-  ① 闭包在**点击 / 触发时**才读那个值（不是注册时用一次）
-  ② 那个值**在注册之后还会变**
-  ③ 闭包**只注册一次**（有 client property 之类的守卫）
-     —— 只挂一次的闭包，捕获的值**永远不会被刷新**
-
-**③ 是关键**，也是把误报压下来的关键：闭包若每次渲染都重挂，捕获的就是新值，无害。
-
-## 输出是「待确认清单」，不是 bug 列表
-
-**本脚本永远返回 0**（不 fail）。这是刻意的：
-
-- 做成 CI 门禁的话，人会为了「消警告」而改坏代码 —— 而这里很多捕获是**正确**的
-- 它保证的是**不漏**（宁可多报），精度靠另一层补：行为探针
-  （`StaleContentProbe` 那种，钉住「内容变了之后回调读的是不是新值」）
-
-## 真实命中长什么样
-
-在当前代码上跑出来是 1 处：
-
-    MessageBubble.kt  applyCollapseIfNeeded  捕获: source
-
-它**不是 bug** —— `source` 是 `currentText().ifBlank { source }` 里的兜底
-（缓冲区为空时退回最初那一版）。**这类「有意保留的兜底」正是需要人工确认的典型**，
-脚本不该替人做这个判断。
-"""
-
 import io
 import os
 import re
 import sys
+
+# 自动定位工程根：脚本在 .zhixueyao/skills/<技能>/scripts/ 下，往上四级即工程根。
+#
+# 这样脚本**放到任何一台机器、任何一个克隆目录都能跑**，不需要改任何常量。
+# 原来这里写的是本机绝对路径，同步到仓库时必须脱敏成占位符 ——
+# 而占位符是**跑不了**的，等于给克隆的人留了个坏掉的脚本。
+#
+# **能自动算出来的东西就不要写成常量。**
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_HERE))))
+_AUTO_SRC = os.path.join(_PROJECT_ROOT, "src", "main", "kotlin", "com", "zhixueyao")
+
+DEFAULT_SRC = _AUTO_SRC if os.path.isdir(_AUTO_SRC) else r"<工程根>/src/main/kotlin/com/zhixueyao"
 
 DEFAULT_UI = "src/main/kotlin/com/zhixueyao/ui"
 

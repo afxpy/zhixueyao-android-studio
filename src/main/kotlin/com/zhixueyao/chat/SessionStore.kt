@@ -115,7 +115,10 @@ object SessionStore {
             val root = Json.Obj()
             root["drafts"] = jsonObjOf(drafts.mapValues { (_, v) -> v.toJson() })
             root["inputLog"] = jsonArrOf(inputLog)
-            uiStateFile.writeText(root.toString(), Charsets.UTF_8)
+            // 草稿与输入历史也走原子写入 —— 它们同样是「丢了会心疼」的数据，
+            // 而且原来这里和 save() 是两份实现（一个直接写、一个临时文件），
+            // 正是「同一件事两份实现」的典型
+            com.zhixueyao.util.AtomicFiles.write(uiStateFile, root.toString())
         }
     }
 
@@ -151,10 +154,35 @@ object SessionStore {
 
     // ---------------- 读写 ----------------
 
-    fun save(session: Session): Boolean = runCatching {
-        fileOf(session.id).writeText(toJsonText(session), Charsets.UTF_8)
-        true
-    }.getOrDefault(false)
+    /**
+     * 保存会话。
+     *
+     * ## 为什么要「先写临时文件再原子改名」
+     *
+     * 原来是一行 `fileOf(id).writeText(...)` —— 直接往目标文件上写。
+     * 这意味着**写到一半被打断，文件就是坏的**：IDE 被强退、机器断电、
+     * 或者进程被杀，都会留下一个截断的 JSON。
+     *
+     * 而坏掉的后果特别重：
+     *
+     * - [load] 用 `runCatching` 兜底返回 null → 会话**静默消失**（不只是丢最后一条）
+     * - [list] 里的 `readMeta` 同样吞掉异常 → 它**连列表里都不出现了**
+     * - 用户看到的是「我的会话没了」，而**没有任何错误提示**
+     *
+     * 这个写入是**每条消息都发生**的，所以撞上崩溃窗口的机会并不像想象中那么小。
+     *
+     * `Files.move` 的原子改名是操作系统保证的：要么还是旧文件，要么已经是完整的新文件，
+     * **不存在「半个文件」的中间态**。`FileSafety` 的备份恢复早就在用这个模式了，
+     * 这里只是跟上。
+     *
+     * 用 `ATOMIC_MOVE` 失败时退回普通 `REPLACE_EXISTING` —— 跨文件系统时
+     * 原子改名会抛 `AtomicMoveNotSupportedException`，而那个场景下
+     * 普通替换仍然比直接写目标文件安全（只是少了原子性，不是退化成裸写）。
+     */
+    fun save(session: Session): Boolean =
+        // 原子写入的实现抽到了 com.zhixueyao.util.AtomicFiles ——
+        // 因为「记忆」「草稿」那边也是同一个需求，**一份实现**才不会各自跑偏。
+        com.zhixueyao.util.AtomicFiles.write(fileOf(session.id), toJsonText(session))
 
     fun load(id: String): Session? = runCatching {
         val f = fileOf(id)
@@ -220,6 +248,8 @@ object SessionStore {
         ),
         // 多版本回答。只有重新生成过才有，所以空的时候不写，老存档也读得懂
         "variants" to jsonArrOf(m.variants),
+        // 附件路径。同样是「空就不写」的老存档兼容写法
+        "attachments" to jsonArrOf(m.attachments),
         "activeVariant" to m.activeVariant,
         "promptTokens" to m.promptTokens,
         "completionTokens" to m.completionTokens
@@ -260,6 +290,9 @@ object SessionStore {
                 reasoning = o.strOr("reasoning", ""),
                 // 老存档没有这两个键 → 空列表 / 0，行为和以前完全一致
                 variants = o.arr("variants")?.items?.mapNotNull { (it as? Json.Str)?.value } ?: emptyList(),
+                // 老存档没有这个字段 → 读到空列表，不会报错
+                attachments = o.arr("attachments")?.items?.mapNotNull { (it as? Json.Str)?.value }
+                    ?: emptyList(),
                 activeVariant = o.int("activeVariant") ?: 0,
                 promptTokens = o.int("promptTokens") ?: 0,
                 completionTokens = o.int("completionTokens") ?: 0

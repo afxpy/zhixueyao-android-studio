@@ -8,6 +8,63 @@ triggers: 界面, 输入框, 附件, 气泡, 按钮, 布局, 表格, 预览窗�
 
 改 `com/zhixueyao/ui/` 下任何文件前，对照这份清单。
 
+## 表格列宽：写死宽度必然横向溢出
+
+用户反馈「临时会话被挤压了」「插件页被挤压了」。查下来是**同一个毛病**：
+
+```kotlin
+table.columnModel.getColumn(0).preferredWidth = 52
+table.columnModel.getColumn(1).preferredWidth = 200
+table.columnModel.getColumn(2).preferredWidth = 130
+table.columnModel.getColumn(3).preferredWidth = 70
+table.columnModel.getColumn(4).preferredWidth = 80
+table.columnModel.getColumn(5).preferredWidth = 320   // 合计 852px
+```
+
+设置页可用宽度没这么宽 → 横向滚动条冒出来 → **最后一列被切掉**
+（截图里路径是 `.../Product/2026-09-28-00.02/抽象日` 就断了）。
+
+### 修法不是「把数字调小」
+
+那换个窗口尺寸又会挤。要让它**自适应**：
+
+```kotlin
+table.autoResizeMode = JTable.AUTO_RESIZE_LAST_COLUMN   // 只调整末列
+table.columnModel.getColumn(0).apply { preferredWidth = 44; maxWidth = 44 }
+// 前面几列固定（内容长度稳定：勾选框、时间、数字）……
+table.columnModel.getColumn(5).apply {
+    preferredWidth = 240
+    minWidth = 120        // **末列必须给下限**
+}
+```
+
+三条都要：
+
+1. `AUTO_RESIZE_LAST_COLUMN` —— 默认的 `SUBSEQUENT_COLUMNS` 在多列时容易溢出
+2. 窄列固定 + **`maxWidth`** —— 勾选框那列不给 maxWidth 会被拉宽，白占地方
+3. **末列必须有 `minWidth`** —— 不设的话窄窗口下会被压成一条线，**比截断更难用**
+
+### 检查：`scan_table_widths.py`
+
+```bash
+python .zhixueyao/skills/zhixueyao-verify-probe/scripts/scan_table_widths.py
+```
+
+判据是**不变量**：所有列的「最坏宽度」之和 ≤ 640px（常见设置页净宽）。
+
+**最坏宽度的算法取决于 resize 模式**（这点最容易写错）：
+
+| 模式 | 最坏宽度 |
+|---|---|
+| `AUTO_RESIZE_LAST_COLUMN` | 前面各列 preferredWidth + **末列 minWidth** |
+| 其他 | 逐列取 minWidth（没设则退回 preferredWidth） |
+
+### 为什么这类问题要做机械检查
+
+1. **不报错** —— 编译过、不崩，只是不好看
+2. **改窗口大小才暴露** —— 开发时窗口开得大，本地看着是好的
+3. **加一列就复发** —— 以后谁再加一列写死宽度，老问题原样回来
+
 ## 1. 圆角卡片：`isOpaque = true` 会把底色填成矩形
 
 `background` + `RoundedLineBorder` 只画描边，**实底还是方的**，看起来仍是方框。

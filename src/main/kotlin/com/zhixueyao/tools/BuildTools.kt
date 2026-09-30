@@ -195,7 +195,7 @@ class RunBuildTool : AgentTool {
         val sb = StringBuilder()
 
         try {
-            com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+            com.zhixueyao.ui.UiKit.ui {
                 try {
                     val manager = CompilerManager.getInstance(project)
                     // 说明：AS 2026 的 CompilerManager 未提供 createCompileScope，

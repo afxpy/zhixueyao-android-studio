@@ -226,7 +226,7 @@ class ReadFileTool : AgentTool {
 
         // 二进制检测：出现 NUL 字节基本可断定非文本
         if (text.contains('\u0000')) {
-            return ToolResult.error("$rawPath 是二进制文件，无法按文本读取（大小 $size 字节）")
+            return ToolResult.error(BinaryHints.explain(rawPath, size))
         }
 
         val lines = text.split('\n')
@@ -264,6 +264,41 @@ private val MEDIA_EXTS = setOf(
     "mp4", "webm", "mov", "mkv", "avi"
 )
 
+/**
+ * 「允许 AI 直接写文件」这个设置的总闸。
+ *
+ * ## 为什么要有这个函数
+ *
+ * 设置页里一直有 `allowDirectWrite`（注释写着「关闭后仅生成差异预览」），
+ * 但**代码里从来没有读过它** —— 用户关掉它，AI 照样直接覆盖文件。
+ *
+ * 这是「伪代码」的典型：界面上有个开关、存进了配置、**实际一点作用都没有**。
+ * 用户是最后一个知道的（只能靠「试了没用」发现）。
+ *
+ * 所以加了这个守卫，并且**在写文件的两条路径上都调用它**
+ *（write_file 和 edit_file，少接一条就等于漏一半）。
+ *
+ * ## 为什么不做「仅生成差异预览」
+ *
+ * 那需要把 diff 渲染回来的能力，是另一个量级的事。
+ * **现在这样更诚实**：关掉就是不让改，并明确告诉模型为什么 ——
+ * 模型会转而在回复里说清「要改哪里、改成什么」，用户自己决定。
+ * 比「一个没有作用的开关」好。
+ */
+private fun directWriteBlocked(): ToolResult? {
+    val allowed = try {
+        com.zhixueyao.settings.ZhixueyaoSettings.getInstance().allowDirectWrite
+    } catch (e: Exception) {
+        true      // 读不到设置时按「允许」—— 不能因为配置问题把工具废掉
+    }
+    if (allowed) return null
+    return ToolResult.error(
+        "用户关闭了「允许 AI 直接写入文件」（设置 → 通用）。\n" +
+            "请不要重试写入，改为**在回复里说明要改哪个文件的哪一部分、改成什么**，" +
+            "让用户自己决定。"
+    )
+}
+
 class WriteFileTool : AgentTool {
     override val name = "write_file"
     override val description =
@@ -281,6 +316,8 @@ class WriteFileTool : AgentTool {
     override fun execute(project: Project, args: Json.Obj): ToolResult {
         val rawPath = args.str("path") ?: return ToolResult.error("缺少 path 参数")
         val content = args.str("content") ?: return ToolResult.error("缺少 content 参数")
+        // 先过总闸 —— 参数校验放在前面，这样「缺参数」的报错仍然准确
+        directWriteBlocked()?.let { return it }
 
         val path = try {
             PathGuard.resolve(project, rawPath)
@@ -338,6 +375,9 @@ class EditFileTool : AgentTool {
     override fun execute(project: Project, args: Json.Obj): ToolResult {
         val rawPath = args.str("path") ?: return ToolResult.error("缺少 path 参数")
         val oldText = args.str("old_text") ?: return ToolResult.error("缺少 old_text 参数")
+        // 和 write_file 同一道闸 —— **改文件的两条路径都要接**，
+        // 只接一条等于这个开关只管一半
+        directWriteBlocked()?.let { return it }
         val newText = args.str("new_text") ?: return ToolResult.error("缺少 new_text 参数")
 
         val path = try {
@@ -634,5 +674,75 @@ private fun refreshParent(path: java.nio.file.Path) {
         com.intellij.openapi.vfs.LocalFileSystem.getInstance()
             .findFileByPath(parent.toString().replace('\\', '/'))
             ?.refresh(false, false)
+    }
+}
+
+/**
+ * 读到二进制文件时该说什么。
+ *
+ * ## 为什么值得单独写一段
+ *
+ * 原来的提示是一句「$rawPath 是二进制文件，无法按文本读取（大小 N 字节）」——
+ * **技术上没错，但完全没用**：模型拿到这句话之后不知道该干什么，
+ * 通常的反应是换个方式再试一次（浪费一轮），或者干脆放弃。
+ *
+ * 而其中好几种格式**其实有明确的下一步**：
+ *
+ * | 格式 | 真正该做的事 |
+ * |---|---|
+ * | 图片 | **让我们自己看** —— 我们有视觉能力，让用户把它作为附件发过来就行 |
+ * | PDF | 让用户截图发过来（我们能看图）；或先转成文本 |
+ * | docx / xlsx | 它们是 zip，里面的 XML 有文字；但目前没做解析器，如实说 |
+ * | zip / jar | 用 unzip 解开再看 |
+ *
+ * 所以这里的原则是：**能给出具体下一步的就说具体下一步，
+ * 给不出的坦白说给不出** —— 而不是统一回一句「读不了」。
+ *
+ * 做成独立 object 是为了能单独探针（见 `BinaryHintProbe`）：
+ * 提示文案是这类工具**唯一的产出**，它错了整个工具就等于没用。
+ */
+object BinaryHints {
+
+    /** 按扩展名给一段「这是什么、你该怎么办」 */
+    fun explain(path: String, size: Long): String {
+        val name = path.substringAfterLast('/').substringAfterLast('\\')
+        val ext = name.substringAfterLast('.', "").lowercase()
+        val sizeText = humanSize(size)
+
+        val head = "「$name」是二进制文件，读不出文本（$sizeText）。"
+
+        return head + "\n" + when (ext) {
+            "png", "jpg", "jpeg", "gif", "webp", "bmp" ->
+                "这是一张图片。**我能直接看图** —— 让用户把它拖进输入框作为附件发过来，" +
+                    "我就能看到内容（截图里的报错、界面问题都属于这种）。"
+
+            "pdf" ->
+                "这是 PDF。我读不了它的文本层（中文 PDF 通常用嵌入字体，需要专门解析才能取出文字）。\n" +
+                    "可行的做法，按推荐顺序：\n" +
+                    "  1. **让用户把它截图发过来** —— 我能看图，这是最快的路子\n" +
+                    "  2. 让用户把 PDF 转成文本或 Markdown 再给我\n" +
+                    "  3. 如果 PDF 就在项目里、又只需要其中几页，也可以只贴那几段文字"
+
+            "docx", "xlsx", "pptx" ->
+                "这是 Office 文档（本质是个 zip 包）。目前没有做解析器，读不出内容。\n" +
+                    "可行的做法：让用户把关键内容贴过来，或者另存为 .md / .txt / .csv 再看。"
+
+            "zip", "jar", "apk", "aar" ->
+                "这是压缩包。要看里面有什么，用 run_script 跑解压命令，或者告诉我你要找的文件名。"
+
+            "class", "dex", "so", "dll", "exe" ->
+                "这是编译产物，读源码请找对应的源文件。"
+
+            else ->
+                "如果它其实是文本（只是编码特殊），可以告诉我，我换个方式读；" +
+                    "如果确实是二进制，说明你想从它那里得到什么，我们再想办法。"
+        }
+    }
+
+    /** 人读的大小 */
+    internal fun humanSize(bytes: Long): String = when {
+        bytes < 1024 -> "$bytes 字节"
+        bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024.0)
+        else -> "%.1f MB".format(bytes / 1024.0 / 1024.0)
     }
 }

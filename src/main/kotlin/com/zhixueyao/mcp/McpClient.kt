@@ -27,6 +27,29 @@ interface McpTransport : AutoCloseable {
     fun notify(message: Json.Obj)
 
     val description: String
+
+    /**
+     * 传输是否还能用。
+     *
+     * ## 为什么状态判断必须包含它
+     *
+     * 服务器进程会**自己死掉**（崩溃、被系统回收、依赖的服务挂了），
+     * 而 `McpManager.live` 里的记录**不会自动消失**。于是出现这种局面：
+     *
+     * | 查询 | 只看 map 的话 | 实际 |
+     * |---|---|---|
+     * | `isConnected(id)` | 仍说「已连接」 | 进程早没了 |
+     * | `stats()` | 仍报「3 个服务器、35 个工具」 | 其中一个是死的 |
+     * | `allTools()` | **仍把死服务器的工具发给模型** | 模型会反复调一个不存在的工具 |
+     *
+     * 前三行加起来就是**界面在说谎**：用户看到一切正常，
+     * 只有真去调的时候才发现不行 —— 而模型因为工具清单里一直有它，会**反复去调**。
+     *
+     * 所以「已连接」= `map 里有记录` **且** `传输还活着`。
+     *
+     * 给默认实现 `true` 是为了不破坏其它实现类；两个真实传输都覆盖了它。
+     */
+    fun isAlive(): Boolean = true
 }
 
 /** 单个 MCP 服务器连接。 */
@@ -256,6 +279,9 @@ class McpConnection(
         )
         transport.notify(msg)
     }
+
+    /** 底层传输是否还活着（见 [McpTransport.isAlive] 里为什么这个判断重要） */
+    fun isAlive(): Boolean = runCatching { transport.isAlive() }.getOrDefault(false)
 
     override fun close() {
         runCatching { transport.close() }

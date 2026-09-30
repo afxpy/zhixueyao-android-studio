@@ -30,6 +30,128 @@ object CodeBlockSupport {
      * 从 Markdown 文本中提取代码块，并尝试为每个块推断目标文件。
      */
     /**
+     * ## 一套解析，两处消费
+     *
+     * 这里原本有**两套独立实现**解析同一个围栏语法：`extractBlocks` 抽卡片、
+     * `stripBlocks` 把代码从正文里摘掉。文档里写着「口径必须完全一致」，
+     * 但**没有任何机制保证** —— 于是它们悄悄分叉了：
+     *
+     * | | extractBlocks | stripBlocks |
+     * |---|---|---|
+     * | 跳收尾围栏 | `i++` 无守卫 | `if (i < lines.size) i++` |
+     * | 空块判定 | `body.isNotEmpty()`（含空行也算） | `nonEmpty > 0`（只数非空行） |
+     * | 围栏长度 | 不区分 | 不区分 |
+     *
+     * 探针（`CodeFenceProbe`）一跑就现原形：
+     *
+     * - **只含空行的块**：正文侧说「没有内容」，卡片侧却**生成一张空卡片**
+     * - **四个反引号包住三反引号**（写 Markdown 教程时的必然输入）：
+     *   围栏被吃掉、`val z = 3` 掉进正文、**一张卡片都没生成**
+     *
+     * 修法不是「把两套改得一样」—— 那只是把下次分叉推迟。而是**只留一套**：
+     * 先解析成分段序列，两个函数各自消费它。这样它们**在构造上就一致**，
+     * 再也不会漂移。（同一个思路：`richRendered` 那次也是「让做决定的那一步
+     * 把结果记下来，别处别自己再判断一次」。）
+     */
+    private sealed interface Seg {
+        data class Text(val text: String) : Seg
+        data class Code(val language: String, val code: String) : Seg
+    }
+
+    /**
+     * 这一行开头的连续反引号个数；不足 3 个返回 0。
+     *
+     * ## 这里刻意**不按 CommonMark 的「最多 3 空格缩进」**
+     *
+     * 标准规定缩进 4 格以上算「缩进代码块」而不是围栏。第一版按标准实现了，
+     * **探针立刻报了一个回归**：4 空格缩进的围栏不再被识别，
+     * ` ```kotlin ` 原样留在正文里（而摘不干净围栏正是本文件要解决的问题）。
+     *
+     * 宽松在这里是对的：输入是**模型的输出**，不是人手写的规范 Markdown。
+     * 模型在列表项里写代码块时很容易缩进 4 格以上：
+     *
+     * ```
+     * 1. 这样做：
+     *     ```kotlin        ← 4 空格，按标准不算围栏，但那明显是个围栏
+     *     val x = 1
+     *     ```
+     * ```
+     *
+     * 判错方向的代价不对称：
+     *  - 宽松误判：把一小段缩进文本当成代码卡片（可接受）
+     *  - 严格漏判：**围栏漏进正文**，富文本会把后面一大段吃成代码样式（难看且难查）
+     *
+     * 所以取宽松。这条约束是**探针钉住的**，不是靠注释提醒。
+     */
+    private fun fenceRun(line: String): Int {
+        val t = line.trimStart()
+        return t.takeWhile { it == '`' }.length.takeIf { it >= 3 } ?: 0
+    }
+
+    /**
+     * 把 Markdown 切成「正文段」与「代码段」。
+     *
+     * 围栏规则按 CommonMark 来：
+     *  - 开围栏：≥3 个反引号，后面可以带语言标注
+     *  - 闭围栏：反引号**不少于**开围栏，且**后面没有别的内容**
+     *
+     * 第二条是修 bug 的关键：` ````markdown ` 开、` ``` ` 收，那三反引号
+     * **不算闭合**（它带着 `kotlin` 标注，而且比开围栏短），于是它连同里面的内容
+     * 一起成为代码 —— 这才符合「用四个反引号包住三反引号」的写法意图。
+     *
+     * **未闭合**时把剩下的全部当代码（流式输出中途、或模型漏了收尾）。
+     * 这是刻意容忍的：宁可多显示一张卡片，也不要把半截代码甩回正文。
+     */
+    private fun parse(markdown: String): List<Seg> {
+        val lines = markdown.lines()
+        val out = mutableListOf<Seg>()
+        val pending = StringBuilder()
+        var i = 0
+
+        fun flushText() {
+            if (pending.isNotEmpty()) {
+                out.add(Seg.Text(pending.toString()))
+                pending.setLength(0)
+            }
+        }
+
+        while (i < lines.size) {
+            val open = fenceRun(lines[i])
+            if (open == 0) {
+                pending.append(lines[i]).append('\n')
+                i++
+                continue
+            }
+
+            // 开围栏后面的第一个词是语言标注
+            val lang = lines[i].trimStart().drop(open).trim().substringBefore(' ')
+
+            val body = StringBuilder()
+            i++
+            while (i < lines.size) {
+                val close = fenceRun(lines[i])
+                val rest = lines[i].trimStart().drop(close).trim()
+                if (close >= open && rest.isEmpty()) {
+                    i++                       // 吃掉收尾围栏
+                    break
+                }
+                body.append(lines[i]).append('\n')
+                i++
+            }
+
+            // **空块不生成代码段** —— 原文里出现 ` ``` ` / ` ``` ` 这一对时
+            // （模型偶尔会这么写），不该在界面上多出一个空卡片。
+            // 判据是 isNotBlank（只数非空行），和占位文案的口径保持一致。
+            if (body.isNotBlank()) {
+                flushText()
+                out.add(Seg.Code(lang, body.toString().trimEnd('\n')))
+            }
+        }
+        flushText()
+        return out
+    }
+
+    /**
      * 把围栏代码块从 Markdown 里**摘掉**，换成一行占位提示。
      *
      * 为什么需要：气泡会把代码块**单独做成卡片**（带语法高亮和「应用」按钮），
@@ -37,83 +159,53 @@ object CodeBlockSupport {
      * 不摘的话同一段代码在气泡里**显示两遍**（一遍在正文、一遍在卡片），
      * 长回答里非常浪费空间、看着也乱。
      *
-     * 口径必须和 [extractBlocks] 完全一致（同一套 ``` 围栏判定）——
-     * 否则会出现「摘掉的」和「做成卡片的」不是同一批，那就更乱。
-     * 探针里专门断言两者的块数相等。
-     *
      * 只处理**围栏块**，不碰行内 `` `code` `` —— 行内的那点代码留在正文里读着更顺。
      */
     fun stripBlocks(markdown: String): String {
-        val lines = markdown.lines()
         val out = StringBuilder()
-        var i = 0
-        while (i < lines.size) {
-            val fence = lines[i].trimStart()
-            if (!fence.startsWith("```")) {
-                out.append(lines[i]).append('\n')
-                i++
-                continue
-            }
-            // 整块跳过（含首尾围栏），只留一行说明
-            i++
-            var nonEmpty = 0
-            while (i < lines.size && !lines[i].trimStart().startsWith("```")) {
-                if (lines[i].isNotBlank()) nonEmpty++
-                i++
-            }
-            if (i < lines.size) i++   // 跳过收尾围栏
-            if (nonEmpty > 0) {
-                out.append("（代码 $nonEmpty 行，见下方代码卡片）").append('\n')
+        for (seg in parse(markdown)) {
+            when (seg) {
+                is Seg.Text -> out.append(seg.text)
+                is Seg.Code -> {
+                    val n = seg.code.lines().count { it.isNotBlank() }
+                    out.append("（代码 ").append(n).append(" 行，见下方代码卡片）").append('\n')
+                }
             }
         }
         return out.toString().trimEnd('\n')
     }
 
+    /**
+     * 从 Markdown 文本中提取代码块，并尝试为每个块推断目标文件。
+     */
     fun extractBlocks(markdown: String): List<Block> {
-        val blocks = mutableListOf<Block>()
-        val lines = markdown.lines()
-        var i = 0
-        var lastPathHint: String? = null
-
         val pathRegex = Regex(
             """(?:^|\s)([\w./\\-]+\.(?:kt|kts|java|xml|gradle|properties|json|toml|pro|md|txt|c|cpp|h|js|ts|py|sql|yml|yaml))"""
         )
 
-        while (i < lines.size) {
-            val line = lines[i]
+        val blocks = mutableListOf<Block>()
+        var lastPathHint: String? = null
 
-            // 记录最近一次出现的文件路径提示，供紧随其后的代码块使用
-            pathRegex.find(line)?.let { m ->
-                val candidate = m.groupValues[1]
-                // 排除明显的 URL 与依赖坐标
-                if (!candidate.startsWith("http") && !candidate.contains("://")) {
-                    lastPathHint = candidate
+        for (seg in parse(markdown)) {
+            when (seg) {
+                is Seg.Text -> {
+                    // 记录最近一次出现的文件路径提示，供紧随其后的代码块使用
+                    pathRegex.find(seg.text)?.let { m ->
+                        val candidate = m.groupValues[1]
+                        // 排除明显的 URL 与依赖坐标
+                        if (!candidate.startsWith("http") && !candidate.contains("://")) {
+                            lastPathHint = candidate
+                        }
+                    }
                 }
-            }
-
-            val fence = line.trimStart()
-            if (fence.startsWith("```")) {
-                val lang = fence.removePrefix("```").trim().substringBefore(' ')
-                val body = StringBuilder()
-                i++
-                while (i < lines.size && !lines[i].trimStart().startsWith("```")) {
-                    body.append(lines[i]).append('\n')
-                    i++
-                }
-                // 跳过收尾的 ```
-                i++
-                if (body.isNotEmpty()) {
-                    blocks.add(
-                        Block(
-                            language = lang,
-                            code = body.toString().trimEnd('\n'),
-                            suggestedPath = lastPathHint
-                        )
+                is Seg.Code -> blocks.add(
+                    Block(
+                        language = seg.language,
+                        code = seg.code,
+                        suggestedPath = lastPathHint
                     )
-                }
-                continue
+                )
             }
-            i++
         }
         return blocks
     }

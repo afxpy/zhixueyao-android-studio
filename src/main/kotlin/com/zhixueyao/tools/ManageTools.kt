@@ -131,7 +131,11 @@ class InstallSkillTool : AgentTool {
         }
         return try {
             dir.mkdirs()
-            File(dir, Skills.SKILL_FILE).writeText(
+            // 原子写入。技能文件丢了 = **这个技能损坏了**（用户的 SKILL.md 直接读不出来），
+            // 而读取端（Skills.all()）是 runCatching 兜底的 —— 坏了就**静默从列表里消失**，
+            // 用户只会觉得「我装的技能怎么没了」。
+            com.zhixueyao.util.AtomicFiles.write(
+                File(dir, Skills.SKILL_FILE),
                 buildString {
                     append("---\n")
                     append("name: ").append(name).append('\n')
@@ -171,7 +175,8 @@ class InstallSkillTool : AgentTool {
                 val target = File(dir, safe)
                 if (!target.canonicalPath.startsWith(dir.canonicalPath)) return@forEach
                 target.parentFile?.mkdirs()
-                target.writeText(text)
+                // 同上：技能目录里的附带文件也是「丢了就损坏」的东西
+                com.zhixueyao.util.AtomicFiles.write(target, text)
                 extras.add(safe)
             }
 

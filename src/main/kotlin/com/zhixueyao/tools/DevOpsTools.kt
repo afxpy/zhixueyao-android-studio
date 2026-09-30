@@ -44,7 +44,9 @@ class GitTool : AgentTool {
     override val description =
         "查看 git 历史与改动（status/diff/log/show/blame/branch/stash list），也能做提交（commit/add/stash）。" +
             "理解一段代码最有效的线索常常是它的历史 —— 改代码前先看看它为什么变成现在这样。" +
-            "**不做 push / reset --hard / clean**（这类操作需要用户自己在终端决定）。"
+            "**不做 reset --hard / clean**（这类操作会丢东西，需要用户自己在终端决定）。" +
+            "push / pull 默认也不做 —— 只有用户**主动在设置里开启 Git 助手**之后才可用，" +
+            "那时插件会按他配好的代理与账号去连，也不会改动他的 git 配置。"
 
     override val parameters: Json.Obj = jsonObj(
         "type" to "object".toJson(),
@@ -54,9 +56,21 @@ class GitTool : AgentTool {
                 "enum" to jsonArr(
                     "status".toJson(), "diff".toJson(), "log".toJson(), "show".toJson(),
                     "blame".toJson(), "branch".toJson(), "stash_list".toJson(),
-                    "add".toJson(), "commit".toJson(), "stash_push".toJson(), "stash_pop".toJson()
+                    "add".toJson(), "commit".toJson(), "stash_push".toJson(), "stash_pop".toJson(),
+                    // push / pull 需要先在设置里开启「Git 助手」—— 没开时调它们会被挡回来，
+                    // 并明确告诉你该去哪儿开。默认姿态没变：**不主动推**。
+                    "push".toJson(), "pull".toJson()
                 ),
-                "description" to "要做什么。diff/show/blame 都需要 path 参数"
+                "description" to "要做什么。diff/show/blame 都需要 path 参数" +
+                    "。push/pull 需先在设置里启用 Git 助手"
+            ),
+            "remote" to jsonObj(
+                "type" to "string".toJson(),
+                "description" to "push/pull 用：远端名，默认 origin"
+            ),
+            "branch" to jsonObj(
+                "type" to "string".toJson(),
+                "description" to "push 用：分支名，默认当前分支"
             ),
             "path" to jsonObj(
                 "type" to "string".toJson(),
@@ -126,6 +140,13 @@ class GitTool : AgentTool {
             )
         }
 
+        // **闸门放在这里**，而不是藏在 buildCommand 里 ——
+        // buildCommand 是纯函数（给定 action 出命令），把权限判断混进去会让它
+        // 既难测也难读。校验和构造分开，各自单一职责。
+        //
+        // 注意：只有 push / pull 会被挡（见 HELPER_REQUIRED）。只读动作一律放行。
+        requireHelper(action)?.let { return ToolResult.error(it) }
+
         val cmd = buildCommand(action, args, path)
             ?: return ToolResult.error(
                 "不认识的动作：$action\n" +
@@ -166,7 +187,17 @@ class GitTool : AgentTool {
             "blame" -> 90_000L
             else -> 30_000L
         }
-        val r = ProcessRunner.run(cmd, java.io.File(base), null, timeout)
+        // 所有 git 命令都套上「Git 助手」的访问参数（没开助手时是空操作）。
+        //
+        // push / pull 额外带上凭据 —— 而且**临时文件在 finally 里删掉**，
+        // 所以必须把执行包在 withCredentialFile 里，不能只把参数拼好就扔出去。
+        val r = if (action == "push" || action == "pull") {
+            withCredentialFile { credArgs ->
+                ProcessRunner.run(withAccess(cmd, credArgs), java.io.File(base), null, timeout)
+            }
+        } else {
+            ProcessRunner.run(withAccess(cmd), java.io.File(base), null, timeout)
+        }
 
         val body = r.combined()
         return when {
@@ -191,9 +222,212 @@ class GitTool : AgentTool {
      * **永远是 List 形式**，不做字符串拼接再交给 shell ——
      * 那样提交信息里的引号、`$`、换行都会变成注入面。
      */
+    /**
+     * 把「Git 助手」里配的访问方式，变成 git 命令上的 `-c` 参数。
+     *
+     * ## 为什么必须做这一步
+     *
+     * 设置页里填了代理、点了「测试连接」显示通过 —— **如果命令不带这些参数，
+     * 那一切就只是装饰**。用户配完还是推不上去，而插件看起来「明明说了能通」。
+     *
+     * 这正是这个工程里反复出现的那个形状：**做对了但没接上**。
+     * 所以配置一落地，就必须有一条路径让它真的流到命令上。
+     *
+     * ## 三种模式
+     *
+     * - 助手**没开** → 一个参数都不加（等于没装过这个功能）
+     * - `direct` → **显式清空**代理。这一条最关键：用户 git 配置里残留的代理
+     *   （这台机器上就是 `57567`，一个早就没开的端口）会继续生效，
+     *   而报错读起来像「网络不通」
+     * - `proxy` / `vpn` → 带上解析出来的代理地址
+     */
+    private fun accessArgs(): List<String> {
+        val s = try {
+            com.zhixueyao.settings.ZhixueyaoSettings.getInstance()
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        if (!s.gitHelperEnabled) return emptyList()
+
+        return when (s.gitAccessMode) {
+            "proxy" -> com.zhixueyao.git.GitProxyDetector.proxyArgs(s.gitProxyUrl)
+            "vpn" -> {
+                val url = if (s.gitVpnPort > 0) "http://127.0.0.1:${s.gitVpnPort}"
+                else com.zhixueyao.git.GitProxyDetector.detectLocalProxy().proxyUrl
+                com.zhixueyao.git.GitProxyDetector.proxyArgs(url)
+            }
+            else -> com.zhixueyao.git.GitProxyDetector.directArgs()
+        }
+    }
+
+    /**
+     * 把「Git 助手」里存的账号，变成 git 能用的凭据参数。
+     *
+     * ## 为什么必须补这一步（我漏过）
+     *
+     * 第一版把 token 加密存好了、设置页也显示「已保存」—— **但 push 时根本没用它**。
+     * 于是用户填完账号去推送，照样失败。而且失败得很安静：
+     * [ProcessRunner] 里设了 `GIT_TERMINAL_PROMPT=0`（这是对的，否则 git 会挂在
+     * 终端上等输入），所以**要密码时它直接返回失败，不会提示「请输入密码」**。
+     *
+     * 用户看到的就是「推不上去」，而设置页明明写着「已保存」。
+     *
+     * ## 凭据怎么传给 git —— 三个方案里选了这个
+     *
+     * | 方案 | 问题 |
+     * |---|---|
+     * | URL 内嵌 `https://user:token@...` | **token 出现在命令行**，同机任何进程都能读到；还会被写进 reflog 的风险 |
+     * | `-c credential.helper=!f(){ echo ...; }` | 同样把 token 塞进命令行 |
+     * | **临时凭据文件 + `store --file=`** | 命令行里**只有路径**；文件短命且权限收紧 |
+     *
+     * 选了第三个。`store` 是 git 自带的凭据助手，`--file` 让它读一个指定文件，
+     * 格式就是普通的 `https://user:token@host` 一行。
+     *
+     * 文件**用完即删**（[withCredentialFile] 里 try/finally）：
+     * 权威副本是 [com.zhixueyao.git.GitCredentials] 里的加密存储，
+     * 明文只在这几秒内、且只在这一个文件里存在。
+     *
+     * ## 没有凭据时不报错，而是什么都不加
+     *
+     * 用户可能用 SSH、或者系统里已经有凭据助手。**没有插件存的凭据 ≠ 不能认证**。
+     * 所以这里安静地返回空，让 git 用自己的方式去试 ——
+     * 硬塞一个「请先填账号」的错误会挡住本来能用的场景。
+     */
+    private fun credentialArgs(): Pair<List<String>, java.io.File?> {
+        val settings = try {
+            com.zhixueyao.settings.ZhixueyaoSettings.getInstance()
+        } catch (e: Exception) {
+            return emptyList<String>() to null
+        }
+        val user = settings.gitUserName.trim()
+        val token = com.zhixueyao.git.GitCredentials.loadToken()
+        if (user.isBlank() || token.isBlank()) return emptyList<String>() to null
+
+        return try {
+            val f = java.io.File.createTempFile("zx-gitcred-", ".txt")
+            f.deleteOnExit()
+            f.writeText("https://$user:$token@github.com\n", Charsets.UTF_8)
+            // 收紧权限：只有本人可读（Windows 上这个调用是 no-op，靠用户目录本身的 ACL）
+            runCatching {
+                f.setReadable(false, false); f.setReadable(true, true)
+                f.setWritable(false, false); f.setWritable(true, true)
+            }
+            listOf("-c", "credential.helper=store --file=${f.absolutePath}") to f
+        } catch (e: Exception) {
+            // 写不出临时文件不该让推送失败 —— 退化成「不带凭据」，让 git 自己想办法
+            emptyList<String>() to null
+        }
+    }
+
+    /**
+     * 带着凭据参数跑一段逻辑，跑完**无论如何**把临时凭据文件删掉。
+     *
+     * `finally` 不能省：推送超时、用户取消、git 报错 —— 每条路径都要清干净。
+     * 漏一条就等于把明文 token 留在了临时目录里。
+     */
+    private fun <T> withCredentialFile(block: (List<String>) -> T): T {
+        val (args, file) = credentialArgs()
+        return try {
+            block(args)
+        } finally {
+            if (file != null) runCatching { file.delete() }
+        }
+    }
+
+    /**
+     * 提交署名（`-c user.name= / user.email=`）。
+     *
+     * ## 为什么必须接上 —— 我差点又犯同一个错
+     *
+     * 设置页里加了「提交署名」两个输入框，**但第一版设置项存了就没人读**。
+     * 这和「token 存了却没接到 push 上」是**完全一样的形状** ——
+     * 用户填了、界面显示已保存、实际一点作用都没有。
+     *
+     * 所以这次是**同一次改动里就把它接上**，而不是等用户回来说「没用」。
+     *
+     * ## 为什么只在 commit 时加，不写进 git config
+     *
+     * 和代理一样用 `-c` 临时传参：关掉插件就等于没装过，
+     * 也不会覆盖用户在自己终端里配好的身份。
+     */
+    private fun authorArgs(): List<String> {
+        val s = try {
+            com.zhixueyao.settings.ZhixueyaoSettings.getInstance()
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        if (!s.gitHelperEnabled) return emptyList()
+        val name = s.gitAuthorName.trim()
+        val email = s.gitAuthorEmail.trim()
+        val out = mutableListOf<String>()
+        if (name.isNotEmpty()) { out += "-c"; out += "user.name=$name" }
+        if (email.isNotEmpty()) { out += "-c"; out += "user.email=$email" }
+        return out
+    }
+
+    /**
+     * 把 `-c` 参数插到 `git` 和子命令之间。
+     *
+     * 位置不能随便放：`git -c k=v <子命令>` 是合法写法，
+     * 而 `git <子命令> -c k=v` **不是** —— 那样 git 会把 `-c` 当成子命令的参数，
+     * 轻则报错，重则被当成路径。
+     */
+    private fun withAccess(cmd: List<String>, extraCredentialArgs: List<String> = emptyList()): List<String> {
+        // 署名只在 commit 时有意义 —— 给别的命令加上去只会让命令行变长
+        val author = if (cmd.size > 1 && cmd[1] == "commit") authorArgs() else emptyList()
+        val extra = accessArgs() + author + extraCredentialArgs
+        if (extra.isEmpty()) return cmd
+        if (cmd.isEmpty() || cmd[0] != "git") return cmd
+        return listOf("git") + extra + cmd.drop(1)
+    }
+
+    /**
+     * 需要「Git 助手已开启」才允许的动作。
+     *
+     * ## 为什么只有这两个
+     *
+     * 只有 **push / pull 会对外产生副作用**（改远端仓库），所以要一道明确的授权。
+     * 其余全是只读或纯本地操作 —— `status` / `log` / `diff` 是 GitTool 最常用的功能
+     * （「改代码前先看看它为什么变成现在这样」），**把它们也挡掉会让整个 git 工具废掉**。
+     *
+     * ## 我在这里踩过一次，探针抓出来的
+     *
+     * 第一版把闸门放在了**所有 action 之前**，于是没开助手时连 `git status` 都返回
+     * 「需要先开启 Git 助手」。`DevToolsProbe` 立刻红了 —— 它测的就是
+     * 「git 六个动作都对」。
+     *
+     * 这个错误的形状值得记：**加权限时把范围划大了**。
+     * 想的是「给新功能加个开关」，实际做成了「给整个工具加个开关」。
+     * 而它**编译能过、跑起来也不崩** —— 只是把一半功能静默关掉了。
+     */
+    private val HELPER_REQUIRED = setOf("push", "pull")
+
+    /** 需要助手但没开时返回提示语；不需要或已开则返回 null */
+    private fun requireHelper(action: String): String? {
+        if (action !in HELPER_REQUIRED) return null
+        val on = try {
+            com.zhixueyao.settings.ZhixueyaoSettings.getInstance().gitHelperEnabled
+        } catch (e: Exception) {
+            false
+        }
+        if (on) return null
+        return "「$action」需要先在设置里开启 Git 助手（设置 → Git 助手 → 启用）。" +
+            "开启后插件会按你配置的代理去连，不会动你的 git 配置。"
+    }
+
     private fun buildCommand(action: String, args: Json.Obj, path: String?): List<String>? =
         when (action) {
             "status" -> listOf("git", "status", "--short", "--branch")
+            // push / pull —— 只在助手开启时可达（调用点先查 requireHelper）。
+            //
+            // 原来这两个是**刻意不做**的（「这类操作需要用户自己在终端决定」）。
+            // 加上它们的前提是有了一道明确的闸门：用户主动开启助手、填好凭据，
+            // 那才算他授权 AI 替他推。**默认仍然是关着的**，姿态没变。
+            "push" -> listOf("git", "push") +
+                (args.str("remote")?.trim()?.takeIf { it.isNotEmpty() }?.let { listOf(it) } ?: emptyList()) +
+                (args.str("branch")?.trim()?.takeIf { it.isNotEmpty() }?.let { listOf(it) } ?: emptyList())
+            "pull" -> listOf("git", "pull") +
+                (args.str("remote")?.trim()?.takeIf { it.isNotEmpty() }?.let { listOf(it) } ?: emptyList())
             "diff" -> buildList {
                 add("git"); add("diff")
                 if (args.bool("staged_only") == true) add("--cached")

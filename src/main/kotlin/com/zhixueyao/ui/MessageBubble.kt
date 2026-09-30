@@ -109,9 +109,82 @@ class MessageBubble(
         // 而不是被甩到 IDE 编辑器里看 XML 原文）；其余 → 交给 IDE 打开。
         addHyperlinkListener { e ->
             if (e.eventType != javax.swing.event.HyperlinkEvent.EventType.ACTIVATED) return@addHyperlinkListener
-            resolveLocalFile(e)?.let { openPreview(it, it.absolutePath) }
+            handleLinkClick(e)
         }
     }
+
+    /**
+     * 点正文里的链接。
+     *
+     * ## 这里原来有个「静默无反应」的 bug
+     *
+     * 原实现是一行：
+     *
+     * ```
+     * resolveLocalFile(e)?.let { openPreview(it, it.absolutePath) }
+     * ```
+     *
+     * `?.let` 的意思是「解析不出来就**什么都不做**」——
+     * 而它上面的注释明明写着「其余 → 交给 IDE 打开」。
+     *
+     * **那个「其余」分支根本没写。** 于是这些情况点了毫无反应，用户以为坏了：
+     *
+     *  - 链接指向 http(s)
+     *  - 链接是**裸文件名**（`random-night-city.svg`）—— 按工程根解析不到，
+     *    而它其实在会话产物目录里（**用户报的正是这个**）
+     *  - 文件已被清理掉
+     *
+     * ## 现在的分流
+     *
+     * 1. 能解析成本地文件 → 开预览窗口（点一下就要看见图，不是甩去编辑器看 XML）
+     * 2. http(s) → 系统浏览器
+     * 3. 解析不出来 → **明确告诉用户找不到**，而不是装作点过了
+     *
+     * 第 3 条是关键：**「点了没反应」比「点了报错」难排查得多** ——
+     * 用户不知道是链接坏了、还是程序卡了、还是自己没点中。
+     */
+    private fun handleLinkClick(e: javax.swing.event.HyperlinkEvent) {
+        val local = resolveLocalFile(e)
+        if (local != null) {
+            openPreview(local, local.absolutePath)
+            return
+        }
+
+        val raw = linkTarget(e)
+        if (raw.isBlank()) return
+
+        // ② http(s)（以及任何能被 URI 认成绝对 URI 的）→ 交给系统
+        if (raw.startsWith("http://", true) || raw.startsWith("https://", true)
+            || raw.startsWith("mailto:", true)
+        ) {
+            val ok = runCatching {
+                java.awt.Desktop.getDesktop().browse(java.net.URI(raw))
+            }.isSuccess
+            if (!ok) {
+                com.intellij.openapi.ui.Messages.showInfoMessage(
+                    this,
+                    "打不开这个链接：\n$raw\n\n（系统里可能没有默认浏览器，或链接格式不受支持）",
+                    "止血药 · 打开链接"
+                )
+            }
+            return
+        }
+
+        // ③ 解析不出来 → 如实说。**不要静默**。
+        com.intellij.openapi.ui.Messages.showInfoMessage(
+            this,
+            "找不到这个文件：\n$raw\n\n" +
+                "几种常见原因：\n" +
+                "· 它是相对路径，而当前没打开工程 —— 相对路径要靠工程根来解析\n" +
+                "· 文件已经被清理掉了（临时产物会随会话清理）\n" +
+                "· 路径里有中文或空格，链接没被正确转义",
+            "止血药 · 打开文件"
+        )
+    }
+
+    /** 从超链接事件里取出原始目标串（URL 优先，退回 description） */
+    private fun linkTarget(e: javax.swing.event.HyperlinkEvent): String =
+        e.url?.toString()?.trim().orEmpty().ifBlank { e.description.orEmpty().trim() }
 
     /**
      * 把正文里的链接解析成本地文件；不是本地文件（http 等）就返回 null。
@@ -120,17 +193,61 @@ class MessageBubble(
      * 也可能写成工程相对路径 —— 三种都要认。
      */
     private fun resolveLocalFile(e: javax.swing.event.HyperlinkEvent): java.io.File? {
-        val raw = e.url?.toString()?.trim().orEmpty().ifBlank { e.description.orEmpty().trim() }
+        val raw = linkTarget(e)
         if (raw.isBlank()) return null
         if (raw.startsWith("http://", true) || raw.startsWith("https://", true)) return null
-        val cleaned = raw.removePrefix("file:///").removePrefix("file://").removePrefix("file:")
-            .let { java.net.URLDecoder.decode(it, "UTF-8") }
-        // 绝对路径直接用；相对路径按工程根解析
+        val cleaned = runCatching {
+            raw.removePrefix("file:///").removePrefix("file://").removePrefix("file:")
+                .let { java.net.URLDecoder.decode(it, "UTF-8") }
+        }.getOrDefault(raw)
+
+        // ① 绝对路径直接用
         val direct = java.io.File(cleaned)
-        val file = if (direct.isAbsolute) direct
-        else java.io.File(project?.basePath ?: return null, cleaned)
-        return if (file.isFile) file else null
+        if (direct.isAbsolute) return direct.takeIf { it.isFile }
+
+        // ② 相对路径按工程根解析
+        project?.basePath?.let { base ->
+            val f = java.io.File(base, cleaned)
+            if (f.isFile) return f
+        }
+
+        // ③ **裸文件名去会话产物目录里找。**
+        //
+        // 这一条是为用户报的那个场景加的：模型在正文里写
+        // 「[打开图片](random-night-city.svg)」—— 只有文件名，没有目录。
+        // 而那个文件其实在 `~/.zhixueyao/Conversation/Product/<会话>/` 下，
+        // 按工程根解析永远找不到，于是点了没反应。
+        //
+        // 只在「不带任何目录分隔符」时才做这个搜索：带目录的相对路径
+        // 应该老老实实按工程根解析，否则会把「工程里的 a/b.kt」误认成产物文件。
+        //
+        // 搜索面是**产物根下两层**（会话目录 → 文件），不打全盘 ——
+        // 那会变成一次全盘遍历，点一下链接卡几秒。
+        if (!cleaned.contains('/') && !cleaned.contains('\\')) {
+            val found = findInProductDirs(cleaned)
+            if (found != null) return found
+        }
+        return null
     }
+
+    /**
+     * 在会话产物目录里找一个**裸文件名**。
+     *
+     * 遍历深度刻意只到「会话目录 → 文件」一层：
+     * 产物都是直接放在会话目录下的（见 SessionWorkspace）。
+     * 递归全盘找的话，用户产物一多就会卡。
+     */
+    private fun findInProductDirs(fileName: String): java.io.File? = runCatching {
+        val root = com.zhixueyao.agent.SessionWorkspace.root()
+        if (!root.isDirectory) return null
+        val dirs = root.listFiles { f -> f.isDirectory } ?: return null
+        // 按修改时间倒序：刚生成的那个更可能是用户点的
+        dirs.sortedByDescending { it.lastModified() }.forEach { d ->
+            val f = java.io.File(d, fileName)
+            if (f.isFile) return f
+        }
+        null
+    }.getOrNull()
 
     /**
      * 富文本的滚动容器。
@@ -315,11 +432,25 @@ class MessageBubble(
         alignmentX = LEFT_ALIGNMENT
     }
 
-    /** 工具卡片容器（默认收起，见 [toolsSummary]） */
+    /**
+     * 工具卡片容器（默认收起，见 [toolsSummary]）。
+     *
+     * ## 这里**不能**设 `isVisible = false`
+     *
+     * 原来写了「默认收起」就顺手把容器也设成不可见 —— 于是出现一个很难看出来的 bug：
+     *
+     * - 点击汇总行只切了**外层滚动容器**（`toolCardsScroll.isVisible`）
+     * - 滚动容器可见了，但它里面的 **view 是隐藏的** → 展开后**一片空白**
+     *
+     * 用户的原话：「展开工具调用什么都没显示出来」。
+     *
+     * 关键在于 **`JScrollPane` 显示的是它的 view** ——
+     * 藏 view 和藏滚动容器是两件事，而「收起」只需要后者。
+     * 把 view 也藏掉，等于让滚动容器变成一个空壳。
+     */
     private val toolCardsPanel = JBPanel<JBPanel<*>>().apply {
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
         isOpaque = false
-        isVisible = false
         alignmentX = LEFT_ALIGNMENT
     }
 
@@ -338,6 +469,17 @@ class MessageBubble(
 
     /** 已挂过的附件路径，避免同一张卡挂两遍（工具结果可能重复上报） */
     private val attachedPaths = mutableSetOf<String>()
+
+    /**
+     * 这个气泡挂了哪些附件（快照）。
+     *
+     * 给 [com.zhixueyao.ui.ChatPanel] 在**轮次结束时**把它存进消息用 ——
+     * 不存的话重开会话就看不到图片（见 `ChatMessage.attachments` 的注释）。
+     *
+     * 返回快照而不是原集合：调用方要把它塞进数据结构存起来，
+     * 给引用的话以后往气泡里加附件会**顺带改到已经存下去的那份**。
+     */
+    fun attachedPathsSnapshot(): List<String> = attachedPaths.toList()
 
     /**
      * 「还没收到第一个字」时的占位。
@@ -440,6 +582,23 @@ class MessageBubble(
     /** 已发生的工具调用次数（汇总行文案） */
     private var toolCallCount = 0
 
+    /**
+     * 工具卡片是否处于展开态。
+     *
+     * ## 为什么要有这个显式标志，而不是看 `toolCardsScroll.isVisible`
+     *
+     * 原来就是那么写的（`val expanded = toolCardsScroll.isVisible`），能跑 ——
+     * 但那是**拿一个组件的可见性当业务状态的代理**。
+     *
+     * 这类写法的问题不是「现在不对」，而是「以后会不对」：
+     * 只要有任何别的地方碰一下那个可见性（折叠会话、重建气泡、动画收尾…），
+     * 展开状态就跟着变了，而**汇总行的文案会和实际状态不一致**。
+     *
+     * 这个工程里已经吃过一次同样的亏（用「JEditorPane 里有没有 HTML」代理
+     * 「渲染过没有」），后来改成了 `richRendered` 显式标记。这里跟上。
+     */
+    private var toolsExpanded = false
+
     /** 正在执行的工具名（为空表示当前没有在跑的工具） */
     private var runningTool: String? = null
 
@@ -469,7 +628,8 @@ class MessageBubble(
 
     /** 「▸ 工具调用 N 次」汇总行：点一下展开/收起逐条卡片 */
     private val toolsSummary = UiKit.linkLabel("") { _ ->
-        toolCardsScroll.isVisible = !toolCardsScroll.isVisible
+        toolsExpanded = !toolsExpanded
+        toolCardsScroll.isVisible = toolsExpanded
         updateToolsSummary()
         revalidate()
         repaint()
@@ -676,7 +836,7 @@ class MessageBubble(
         }
         headerRow.add(headerSide, if (toRight) BorderLayout.EAST else BorderLayout.WEST)
         content.add(headerRow)
-        content.add(Box.createVerticalStrut(4))
+        content.add(UiKit.strut(4))
 
         // 脚注右侧只放「模型 · 时间」：头像在头部，不重复（一条消息两个同款头像很怪）
         val footerRight = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
@@ -1062,7 +1222,7 @@ class MessageBubble(
         codeBlocksPanel.removeAll()
         for (block in blocks) {
             codeBlocksPanel.add(buildCodeBlockCard(block))
-            codeBlocksPanel.add(javax.swing.Box.createVerticalStrut(4))
+            codeBlocksPanel.add(UiKit.strut(4))
         }
         codeBlocksPanel.isVisible = true
         revalidate()
@@ -1609,7 +1769,7 @@ class MessageBubble(
         codeBlocksPanel.removeAll()
         for (block in blocks) {
             codeBlocksPanel.add(buildCodeBlockCard(block))
-            codeBlocksPanel.add(Box.createVerticalStrut(4))
+            codeBlocksPanel.add(UiKit.strut(4))
         }
         codeBlocksPanel.isVisible = blocks.isNotEmpty()
 
@@ -2128,7 +2288,7 @@ class MessageBubble(
         activeToolCards[callId] = card
         lastToolCard = card
         toolCardsPanel.add(card)
-        toolCardsPanel.add(javax.swing.Box.createVerticalStrut(6))
+        toolCardsPanel.add(UiKit.strut(6))
 
         // 条目上限：Swing 没有虚拟列表，靠「只保留最近 N 张」把组件数钉死。
         // 一次长任务动辄上百次调用，全留着会把布局和绘制拖垮。
@@ -2160,7 +2320,7 @@ class MessageBubble(
             toolsSummary.isVisible = false
             return
         }
-        val expanded = toolCardsScroll.isVisible
+        val expanded = toolsExpanded
         toolsSummary.isVisible = true
         // 进行中就说「正在做什么」，做完只留一行淡色汇总 ——
         // 对齐 WorkBuddy：操作过程是**虚字**，正常回答才是实字

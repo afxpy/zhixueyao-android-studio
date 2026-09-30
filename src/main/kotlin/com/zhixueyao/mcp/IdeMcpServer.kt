@@ -34,6 +34,19 @@ class IdeMcpServer(
     private val log = Logger.getInstance(IdeMcpServer::class.java)
     private var server: HttpServer? = null
 
+    /**
+     * 线程池**必须存成字段**。
+     *
+     * 原来只写了 `srv.executor = Executors.newFixedThreadPool(4){...}`，
+     * 引用没有留下来 —— 于是 `stop()` 里没有它可关（想关也关不了）。
+     *
+     * 这是 `HttpServer` 一个很容易踩的地方：**`stop()` 不会关掉用户传进去的 executor**
+     * （JDK 文档写得很明确，但 API 名字太像会让人以为它会一起关）。
+     * 结果就是每启停一次泄漏最多 4 个线程 —— 而固定线程池的核心线程**永不超时**，
+     * 所以它们会一直挂着，直到整个 JVM 退出。
+     */
+    private var executor: java.util.concurrent.ExecutorService? = null
+
     val isRunning: Boolean get() = server != null
 
     @Synchronized
@@ -41,17 +54,23 @@ class IdeMcpServer(
         if (server != null) return true
         return try {
             val srv = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), port), 0)
-            srv.executor = Executors.newFixedThreadPool(4) { r ->
+            val pool = Executors.newFixedThreadPool(4) { r ->
                 Thread(r, "zhixueyao-mcp-server").apply { isDaemon = true }
             }
+            srv.executor = pool
             srv.createContext("/") { exchange -> handle(exchange) }
             srv.start()
             server = srv
+            executor = pool
             log.info("止血药 MCP 服务已启动：http://127.0.0.1:$port/")
             true
         } catch (e: Exception) {
             log.warn("启动 MCP 服务失败", e)
+            // 启动失败也要把刚建的池收掉 —— 否则「端口被占用」这种常见错误
+            // 每试一次就漏一个池（用户可能会反复点重试）
+            runCatching { executor?.shutdownNow() }
             server = null
+            executor = null
             false
         }
     }
@@ -59,7 +78,12 @@ class IdeMcpServer(
     @Synchronized
     fun stop() {
         runCatching { server?.stop(0) }
+        // 两件事都要做：停服务**和**收线程池。
+        // 用 shutdownNow 而不是 shutdown：此刻还在处理中的请求已经随着 server 停下而失去意义，
+        // 让它们尽快中断比等它们跑完好（而且不中断的话，长请求会拖住池不释放）。
+        runCatching { executor?.shutdownNow() }
         server = null
+        executor = null
     }
 
     private fun handle(exchange: HttpExchange) {

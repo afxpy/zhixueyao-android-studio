@@ -70,7 +70,17 @@ class McpManager {
     private val live = ConcurrentHashMap<String, LiveServer>()
     private val errors = ConcurrentHashMap<String, String>()
 
-    /** 建立（或重建）指定服务器的连接。 */
+    /**
+     * 建立（或重建）指定服务器的连接。
+     *
+     * `@Synchronized` 是必需的：这个方法开头会 `disconnect(id)` 再建新连接，
+     * 两次并发调用同一个 id 的话 —— 两边都会先断开、再各建一个传输，
+     * 而 `live[id]` 只留得下最后一个。**第一个连接就成了没人认得、也没人会关的泄漏**
+     * （进程 + 线程 + socket 全留着）。
+     *
+     * 加锁的代价可以忽略：连接本身是秒级的慢操作，而且不常发生。
+     */
+    @Synchronized
     fun connect(config: McpServerConfig): LiveServer {
         disconnect(config.id)
 
@@ -118,25 +128,57 @@ class McpManager {
         return failures
     }
 
+    @Synchronized
     fun disconnect(id: String) {
         live.remove(id)?.let { runCatching { it.close() } }
+    }
+
+    /**
+     * 把已经死掉的连接从 [live] 里摘掉，并记下原因。
+     *
+     * 在**所有对外查询之前**调用。不这么做的话：
+     * 服务器进程崩了 → `live` 里还留着它 → `isConnected` 说 true、
+     * `stats()` 报它的工具数、`allTools()` 把它的工具发给模型 ——
+     * **界面在说谎，模型会反复去调一个已经不存在的工具。**
+     *
+     * 这里选择「摘掉 + 记原因」而不是「自动重连」：自动重连会掩盖问题
+     * （用户永远不会知道服务器崩过），而且重连本身也可能反复失败。
+     * 摘掉之后 `errorOf(id)` 能给出原因，用户在设置页看得见。
+     */
+    @Synchronized
+    private fun pruneDead() {
+        val dead = live.entries.filter { (_, server) ->
+            runCatching { !server.connection.isAlive() }.getOrDefault(false)
+        }
+        for ((id, server) in dead) {
+            live.remove(id)
+            if (errors[id] == null) {
+                errors[id] = "服务器进程已退出（连接已失效）。可在设置页重新连接。"
+            }
+            runCatching { server.close() }
+        }
     }
 
     fun disconnectAll() {
         live.keys.toList().forEach { disconnect(it) }
     }
 
-    fun isConnected(id: String): Boolean = live.containsKey(id)
+    fun isConnected(id: String): Boolean {
+        pruneDead()
+        return live.containsKey(id)
+    }
 
     fun errorOf(id: String): String? = errors[id]
 
     fun toolCount(id: String): Int = live[id]?.tools?.size ?: 0
 
     /** 汇总所有已连接服务器的工具，名称已加前缀。 */
-    fun allTools(): List<PrefixedTool> =
-        live.values.flatMap { server ->
+    fun allTools(): List<PrefixedTool> {
+        pruneDead()
+        return live.values.flatMap { server ->
             server.tools.map { PrefixedTool(server.config.id, server.config.name, it) }
         }
+    }
 
     /**
      * 汇总各服务器在 initialize 时下发的使用说明。
@@ -147,14 +189,19 @@ class McpManager {
      *
      * @return 每项为「服务器名 → 说明」，已过滤空值
      */
-    fun allInstructions(): List<Pair<String, String>> =
-        live.values.mapNotNull { server ->
+    fun allInstructions(): List<Pair<String, String>> {
+        pruneDead()
+        return live.values.mapNotNull { server ->
             val text = server.connection.instructions.trim()
             if (text.isEmpty()) null else server.config.name to text
         }
+    }
 
     /** 已连接服务器数量与工具总数，供状态展示。 */
-    fun stats(): Pair<Int, Int> = live.size to live.values.sumOf { it.tools.size }
+    fun stats(): Pair<Int, Int> {
+        pruneDead()
+        return live.size to live.values.sumOf { it.tools.size }
+    }
 
     /** 调用工具。传入的是加前缀后的名称。 */
     fun callTool(
@@ -162,6 +209,7 @@ class McpManager {
         arguments: Json,
         cancelFlag: java.util.concurrent.atomic.AtomicBoolean? = null
     ): McpToolResult {
+        pruneDead()
         val parsed = parsePrefixed(prefixedName)
             ?: throw McpException("无法识别的工具名称：$prefixedName")
         val server = live[parsed.first]

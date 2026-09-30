@@ -53,10 +53,37 @@ object TableSection {
         box.isOpaque = false
         box.alignmentX = Component.LEFT_ALIGNMENT
 
+        /**
+         * 加一个间距，**并且把它也左对齐**。
+         *
+         * ## 这个 helper 是用户报的布局 bug 的修复
+         *
+         * `Box.createVerticalStrut()` 返回的是 `Filler`，**它的 `alignmentX` 默认是 0.5（居中）**。
+         * 而纵向 `BoxLayout` 的对齐规则是：**混用不同的 alignmentX 时，
+         * 整块内容会被按最大/中间那个基准推偏** ——
+         * 于是「左对齐的 header + 左对齐的表格」被一个居中的 6px 间距**整体推到了右边**。
+         *
+         * 症状就是用户截图里的：**表格只占右半边，左边空一大片**，
+         * 而同页面里没经过 BoxLayout 的按钮行却正常贴在左边。
+         *
+         * ## 为什么值得单独写个函数
+         *
+         * 这个坑**只要有人加一行 `Box.createVerticalStrut(...)` 就会重现** ——
+         * 而它看起来完全无害（谁会怀疑一个间距？）。
+         * 包成函数之后，「加间距」这件事**只有一个正确写法**，
+         * 下一个加间距的人不会有机会踩到它。
+         */
+        fun gap(h: Int) {
+            // 直接用共用实现 —— 这正是不该在这里手写第二份的理由：
+            // 我第一版在这里手写的 apply 就写错了（Component 上没有 alignmentX），
+            // 而 UiKit.strut 里那行是能编译的。
+            box.add(UiKit.strut(h))
+        }
+
         header?.let {
             it.alignmentX = Component.LEFT_ALIGNMENT
             box.add(it)
-            box.add(Box.createVerticalStrut(6))
+            gap(6)
         }
 
         box.add(
@@ -71,7 +98,9 @@ object TableSection {
         )
 
         toolbar?.let {
-            box.add(Box.createVerticalStrut(8))
+            gap(8)
+            // toolbar 原来也没设 —— 同一个错，只是它在两张截图里恰好看不出来
+            it.alignmentX = Component.LEFT_ALIGNMENT
             box.add(it)
         }
         return box

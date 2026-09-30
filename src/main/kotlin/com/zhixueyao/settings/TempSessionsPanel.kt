@@ -85,13 +85,31 @@ class TempSessionsPanel {
         table.rowHeight = 26
         table.emptyText.text = "还没有临时产物（用过 generate_svg / save_asset 之后才会出现）"
         table.selectionModel.selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION
-        // 列宽：勾选窄，路径宽
-        table.columnModel.getColumn(0).preferredWidth = 52
-        table.columnModel.getColumn(1).preferredWidth = 200
-        table.columnModel.getColumn(2).preferredWidth = 130
-        table.columnModel.getColumn(3).preferredWidth = 70
-        table.columnModel.getColumn(4).preferredWidth = 80
-        table.columnModel.getColumn(5).preferredWidth = 320
+        // 列宽：窄列固定，**最后一列（路径）吸收剩余宽度**。
+        //
+        // 原来六列全是写死的 preferredWidth，合计 52+200+130+70+80+320 = 852px。
+        // 设置页可用宽度通常没这么宽 —— 于是横向滚动条冒出来，**路径列被切掉**
+        // （用户反馈「临时会话被挤压了」，截图里路径是 `.../Product/2026-09-28-00.02/抽象日` 就断了）。
+        //
+        // 修法不是「把数字调小」（换个窗口尺寸又会挤），而是让布局**自适应**：
+        //  - `AUTO_RESIZE_LAST_COLUMN`：只调整最后一列，让它填满视口
+        //  - 前面几列保持固定（它们的内容长度本来就稳定：勾选框、时间、数字）
+        //  - 路径列给 `minWidth` 兜底 —— 不加的话窄窗口下会被压成 0 宽（比截断更难用）
+        //
+        // 现在固定部分只占 44+170+115+60+75 = 464px，路径至少 120px，
+        // 合计 584px 就能完整显示，常见窗口宽度都够。
+        table.autoResizeMode = javax.swing.JTable.AUTO_RESIZE_LAST_COLUMN
+        table.columnModel.getColumn(0).preferredWidth = 44
+        table.columnModel.getColumn(0).maxWidth = 44
+        table.columnModel.getColumn(1).preferredWidth = 170
+        table.columnModel.getColumn(2).preferredWidth = 115
+        table.columnModel.getColumn(3).preferredWidth = 60
+        table.columnModel.getColumn(4).preferredWidth = 75
+        // 路径列：宽度不固定，由视口剩余空间决定；下限 120 保证还能看出是哪个目录
+        table.columnModel.getColumn(5).apply {
+            preferredWidth = 240
+            minWidth = 120
+        }
         // 双击 = 在系统文件管理器里打开那个目录（用户想自己看看是什么）
         table.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
@@ -125,14 +143,43 @@ class TempSessionsPanel {
             addActionListener { onClick() }
         }
 
+    /**
+     * 刷新临时会话列表。
+     *
+     * ## 为什么要异步（和知识库/技能同一个毛病）
+     *
+     * `SessionWorkspace.list()` 会**遍历临时会话目录、统计每个目录的大小**。
+     * 而 `refresh()` 被这几处调用，**全在 EDT 上**：
+     *   - 面板构建时（打开「临时会话」页就触发）
+     *   - 「刷新」按钮
+     *   - 删除之后
+     *
+     * 用户问「请确保临时会话功能有效果」—— 这一处就是它可能「看起来没反应」的原因：
+     * 目录里有几十个会话时，扫描会压在界面线程上，
+     * 表现是**点「刷新」之后界面顿一下、或者干脆像没点**。
+     *
+     * 修法和 `refreshKbInfo` / `refreshSkillsInfo` 一致：
+     * **扫描放后台，只有碰组件的部分留在 EDT。**
+     */
     private fun refresh() {
-        model.setData(SessionWorkspace.list())
-        val total = model.totalBytes()
-        val dir = SessionWorkspace.root()
-        totalLabel.text = buildString {
-            append("共 ").append(model.rowCount).append(" 个会话目录，合计 ")
-            append(if (total >= 1024L * 1024) "%.1f MB".format(total / 1024.0 / 1024.0) else "%.0f KB".format(total / 1024.0))
-            append("　·　").append(dir.absolutePath)
+        totalLabel.text = "正在统计…"
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            // 后台只做读盘和统计，不碰任何 Swing 组件
+            val entries = try {
+                SessionWorkspace.list()
+            } catch (t: Throwable) {
+                emptyList()
+            }
+            val total = entries.sumOf { it.bytes }
+            val dir = SessionWorkspace.root()
+            UiKit.ui {
+                model.setData(entries)
+                totalLabel.text = buildString {
+                    append("共 ").append(entries.size).append(" 个会话目录，合计 ")
+                    append(if (total >= 1024L * 1024) "%.1f MB".format(total / 1024.0 / 1024.0) else "%.0f KB".format(total / 1024.0))
+                    append("　·　").append(dir.absolutePath)
+                }
+            }
         }
     }
 

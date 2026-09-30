@@ -222,7 +222,16 @@ class ModelPickerDialog private constructor(
         statusLabel.text = "正在从 $baseUrl 拉取模型列表…"
 
         ApplicationManager.getApplication().executeOnPooledThread {
-            val r = ModelCatalog.fetch(baseUrl, apiKey, format)
+            // **后台必须包住异常。**
+            //
+            // 这里的 `fetch` 要发网络请求 —— 抛出来的话后面那句 invokeLater
+            // 就成了死代码，界面会**永远停在「正在拉取…」**，而且不报任何错。
+            // （这是「静默失效」扫描查出来的，同类问题今晚在设置页已经踩过一次。）
+            val r = try {
+                ModelCatalog.fetch(baseUrl, apiKey, format)
+            } catch (t: Throwable) {
+                ModelListResult.Err("拉取失败：" + (t.message ?: t.javaClass.simpleName))
+            }
             javax.swing.SwingUtilities.invokeLater {
                 when (r) {
                     is ModelListResult.Ok -> {

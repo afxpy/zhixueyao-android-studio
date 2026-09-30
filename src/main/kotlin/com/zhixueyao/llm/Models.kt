@@ -37,7 +37,42 @@ data class ChatMessage(
      * 0 = 服务商没回报（界面退回估算，不写进这里）。
      */
     val promptTokens: Int = 0,
-    val completionTokens: Int = 0
+    val completionTokens: Int = 0,
+
+    /**
+     * 这一轮产出的**附件路径**（图片/文件），只给界面用，不回传。
+     *
+     * ## 为什么存在消息上
+     *
+     * 原来附件只活在界面上：`addAttachment` 把预览卡加进气泡，
+     * 而**会话存档里一个字段都没有**。后果是**重开会话，图片全不见了** ——
+     * 只剩正文里那句「已生成一张图片」（那是 Markdown 文本，存下来了）。
+     *
+     * 用户的原话：「怎么图片不见了？」
+     *
+     * 挂在消息上而不是会话上，是因为**附件属于某一轮回答**；
+     * 和 [variants] 一样属于「只给界面看」的字段，所以放在这里是一致的。
+     *
+     * 存的是**路径不是内容**：图片 base64 进存档会让会话文件涨到几 MB，
+     * 而且临时产物被清理之后，路径失效也比存一份过期副本更好判断。
+     *
+     * ## 为什么必须加在**最后**
+     *
+     * 这里踩了个坑，代价是 4 个探针一起红。
+     *
+     * 一开始按语义把它插在 `reasoning` 后面（「都是只给界面看的」），
+     * 结果 `VariantProbe` / `UsageDisplayProbe` / `TokenSlimProbe` /
+     * `HistoryGroupingProbe` 全挂了 —— 它们用**位置参数**构造 `ChatMessage`，
+     * 新字段插在中间会让后面所有参数**整体错位**。
+     *
+     * 而错位**编译期不一定报错**：`List<String>` 和 `int` 混着传时，
+     * 类型碰巧对得上编译器就沉默，运行也不崩，只是**字段值全是错的** ——
+     * 是探针靠断言值把它抓出来的。
+     *
+     * 加在末尾则完全安全（原有位置参数一个个对应原位，新字段拿默认值）。
+     * **data class 加字段，一律加在最后。**
+     */
+    val attachments: List<String> = emptyList()
 ) {
     enum class Role { SYSTEM, USER, ASSISTANT, TOOL }
 

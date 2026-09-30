@@ -21,6 +21,7 @@ import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import com.intellij.ui.components.JBScrollPane
 import javax.swing.Icon
+import javax.swing.Box
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JLabel
@@ -1039,6 +1040,69 @@ object UiKit {
     // ---------------- 分隔线 ----------------
 
     /** 水平分隔线。 */
+    /**
+     * 纵向间距，**并且左对齐**。
+     *
+     * ## 为什么不能直接用 `Box.createVerticalStrut()`
+     *
+     * 它返回的 `Filler` 的 `alignmentX` **默认是 0.5（居中）**。
+     * 而纵向 `BoxLayout` 的对齐规则是：**子组件的 alignmentX 混用时，整块会被推偏** ——
+     * 一个看起来完全无害的 6px 间距，会把左对齐的兄弟组件**整体推到右边**。
+     *
+     * 用户报的「表格只占右半边、左边空一大片」就是这个：
+     * `TableSection.panel` 里两处 strut 都没设 alignmentX。
+     *
+     * ## 全工程扫了一遍，还有 10 处同样的问题
+     *
+     * 而**症状只在其中两处露了馅**（表格那两处），其余 8 处只是「看起来有点偏」，
+     * 没人报过。所以这次不是修一处，是**把这个写法换掉**：
+     * 包成函数之后，「加纵向间距」只剩一个正确写法。
+     *
+     * 判据：**凡是往纵向 BoxLayout 里加东西，就一律用这个函数。**
+     */
+    fun strut(h: Int): java.awt.Component =
+        Box.createVerticalStrut(h).apply {
+            (this as? JComponent)?.alignmentX = java.awt.Component.LEFT_ALIGNMENT
+        }
+
+    /**
+     * 回到 EDT 执行一个回调，**并且不受模态状态影响**。
+     *
+     * ## 这个函数解决的是一整类「功能全都无效」的问题
+     *
+     * 用户报「git 助手里所有功能都无效，技能库、知识库、记忆一直读取不到」——
+     * 而它们的代码结构**完全一样**：
+     *
+     * ```
+     * executeOnPooledThread {          // 后台干活（这部分是好的）
+     *     val data = 读文件()
+     *     ApplicationManager.getApplication().invokeLater {   // ← 结果回不来
+     *         更新界面(data)
+     *     }
+     * }
+     * ```
+     *
+     * 后台确实跑完了，**但 `invokeLater` 的回调一直不执行**：
+     * 它默认用的是「当前模态状态」，而**IDE 的设置页是一个模态对话框** ——
+     * 于是这些回调被排到「模态结束之后」，也就是**你要关掉设置页才会执行**。
+     *
+     * **看代码完全看不出问题**：写法标准、线程也对、没有异常。
+     * 症状只有一个：「一直显示正在读取」。
+     *
+     * ## 为什么用 ModalityState.any()
+     *
+     * 这些回调做的事都是「把后台算好的结果铺到界面上」——
+     * 它们**不依赖用户交互**，也**不需要等某个对话框关掉**。
+     * `ModalityState.any()` 明确表达这个意思：不管当前是什么模态，照常执行。
+     *
+     * （写聊天窗的异步时不需要这个 —— 它在工具窗口里，本来就非模态。
+     *  所以同样的写法在那里没事，搬到设置页就集体失效。）
+     */
+    fun ui(block: () -> Unit) {
+        com.intellij.openapi.application.ApplicationManager.getApplication()
+            .invokeLater(block, com.intellij.openapi.application.ModalityState.any())
+    }
+
     fun separator(): JComponent = JBPanel<JBPanel<*>>(BorderLayout()).apply {
         isOpaque = false
         preferredSize = Dimension(1, 1)
