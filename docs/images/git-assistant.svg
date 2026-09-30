@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="420" viewBox="0 0 880 420" font-family="'Segoe UI','Microsoft YaHei',sans-serif">
+  <!-- Git 助手：一次 push 的完整流程（暗色主题） -->
+  <rect width="880" height="420" fill="#1E1F22"/>
+  <defs>
+    <marker id="arw2" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0 0 L8 3 L0 6 z" fill="#6E7781"/>
+    </marker>
+  </defs>
+
+  <text x="24" y="34" fill="#DFE1E5" font-size="14" font-weight="600">Git 助手 · 点一次 push 背后发生的事</text>
+
+  <!-- 步骤 ① -->
+  <rect x="24" y="64" width="152" height="158" rx="10" fill="#2B2D30" stroke="#3C3F44"/>
+  <circle cx="44" cy="88" r="9" fill="#FF6B5B"/>
+  <text x="44" y="92" fill="#FFFFFF" font-size="11" font-weight="600" text-anchor="middle">1</text>
+  <text x="62" y="93" fill="#DFE1E5" font-size="12.5" font-weight="600">预检</text>
+  <g font-size="10.8" fill="#AEB4BB">
+    <text x="40" y="126">ls-remote 探一次远端</text>
+    <text x="40" y="146">同时验证连通与凭据</text>
+    <text x="40" y="166">问题暴露在推送之前</text>
+  </g>
+
+  <line x1="178" y1="143" x2="190" y2="143" stroke="#6E7781" stroke-width="1.4" marker-end="url(#arw2)"/>
+
+  <!-- 步骤 ② -->
+  <rect x="194" y="64" width="152" height="158" rx="10" fill="#2B2D30" stroke="#3C3F44"/>
+  <circle cx="214" cy="88" r="9" fill="#FF6B5B"/>
+  <text x="214" y="92" fill="#FFFFFF" font-size="11" font-weight="600" text-anchor="middle">2</text>
+  <text x="232" y="93" fill="#DFE1E5" font-size="12.5" font-weight="600">分叉预判</text>
+  <g font-size="10.8" fill="#AEB4BB">
+    <text x="210" y="126">fetch 后判断两边关系</text>
+    <text x="210" y="146">领先 / 落后 / 无共同祖先</text>
+    <text x="210" y="166">先讲清楚，不硬推</text>
+  </g>
+
+  <line x1="348" y1="143" x2="360" y2="143" stroke="#6E7781" stroke-width="1.4" marker-end="url(#arw2)"/>
+
+  <!-- 步骤 ③ -->
+  <rect x="364" y="64" width="152" height="158" rx="10" fill="#2B2D30" stroke="#3C3F44"/>
+  <circle cx="384" cy="88" r="9" fill="#FF6B5B"/>
+  <text x="384" y="92" fill="#FFFFFF" font-size="11" font-weight="600" text-anchor="middle">3</text>
+  <text x="402" y="93" fill="#DFE1E5" font-size="12.5" font-weight="600">推送</text>
+  <g font-size="10.8" fill="#AEB4BB">
+    <text x="380" y="126">按你设置的方式去连</text>
+    <text x="380" y="146">直连 / 代理，不擅自换</text>
+    <text x="380" y="166">凭据临时文件用完即删</text>
+  </g>
+
+  <line x1="518" y1="143" x2="530" y2="143" stroke="#6E7781" stroke-width="1.4" marker-end="url(#arw2)"/>
+
+  <!-- 步骤 ④ -->
+  <rect x="534" y="64" width="152" height="158" rx="10" fill="#2B2D30" stroke="#3C3F44"/>
+  <circle cx="554" cy="88" r="9" fill="#FF6B5B"/>
+  <text x="554" y="92" fill="#FFFFFF" font-size="11" font-weight="600" text-anchor="middle">4</text>
+  <text x="572" y="93" fill="#DFE1E5" font-size="12.5" font-weight="600">核对</text>
+  <g font-size="10.8" fill="#AEB4BB">
+    <text x="550" y="126">再查一次远端 hash</text>
+    <text x="550" y="146">一致才算推送成功</text>
+    <text x="550" y="166">hook / 保护拦截可发现</text>
+  </g>
+
+  <line x1="688" y1="143" x2="700" y2="143" stroke="#6E7781" stroke-width="1.4" marker-end="url(#arw2)"/>
+
+  <!-- 步骤 ⑤ -->
+  <rect x="704" y="64" width="152" height="158" rx="10" fill="#2B2D30" stroke="#3C3F44"/>
+  <circle cx="724" cy="88" r="9" fill="#FF6B5B"/>
+  <text x="724" y="92" fill="#FFFFFF" font-size="11" font-weight="600" text-anchor="middle">5</text>
+  <text x="742" y="93" fill="#DFE1E5" font-size="12.5" font-weight="600">去向报告</text>
+  <g font-size="10.8" fill="#AEB4BB">
+    <text x="720" y="126">报告推到了哪个分支</text>
+    <text x="720" y="146">非默认分支会提醒</text>
+    <text x="720" y="166">不用猜「首页为何没变化」</text>
+  </g>
+
+  <!-- 失败分类带 -->
+  <rect x="24" y="244" width="832" height="56" rx="8" fill="#26282B" stroke="#3C3F44"/>
+  <text x="40" y="267" fill="#DFE1E5" font-size="11.5" font-weight="600">失败时自动分类（都是确定性检查，不靠模型猜）</text>
+  <text x="40" y="289" fill="#AEB4BB" font-size="11">连接 → 排查步骤与当前模式　·　认证 → GCM / Token 两条路　·　非快进 → 合并选项　·　冲突 → 列出冲突文件</text>
+
+  <!-- 安全边界带 -->
+  <rect x="24" y="312" width="832" height="56" rx="8" fill="#26282B" stroke="#3C3F44"/>
+  <text x="40" y="335" fill="#DFE1E5" font-size="11.5" font-weight="600">安全边界（都不做）</text>
+  <text x="40" y="357" fill="#AEB4BB" font-size="11">reset --hard / clean　·　强推　·　自动改用其它代理　·　带密钥或误生成文件的提交</text>
+
+  <text x="24" y="398" fill="#7E848C" font-size="10.5">提交守卫在 commit 前扫描暂存区：文件名带空格 / 0 字节新文件 / 超 50MB / 疑似密钥 —— 拦下并要求确认。</text>
+</svg>
