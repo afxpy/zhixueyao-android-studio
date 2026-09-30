@@ -2403,7 +2403,7 @@ class ZhixueyaoConfigurable : Configurable, Configurable.NoScroll {
         gitVpnPortField.columns = 10
         gitVpnPortField.emptyText.text = "留空 = 自动检测"
         val vpnBefore = form.panel.componentCount
-        form.row("VPN 端口", gitVpnPortField, "留空则自动扫描常见端口（推荐）")
+        form.row("VPN 端口", gitVpnPortField, "留空则自动探测常见端口（60 秒内只探一次，不会频繁打扰代理）")
         gitVpnRow.addAll(form.panel.components.drop(vpnBefore).toList())
         // 这一条是用户实测之后补的 —— 见下面的说明。
         form.hintRow(

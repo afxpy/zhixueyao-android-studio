@@ -80,9 +80,11 @@ Git 助手默认关闭。开启后，AI 才能在用户明确允许的范围内�
 
 支持的 Git 操作包括：
 
-- 只读：`status`、`diff`、`log`、`show`、`blame`、`branch`、`stash list`。
-- 写入：`add`、`commit`、`stash push`、`stash pop`。
+- 只读：`status`、`diff`、`log`、`show`、`blame`、`branch`、`stash list`、`remote`、`fetch`、`diagnose`。
+- 写入：`add`、`commit`、`stash push`、`stash pop`、`merge`、`merge_abort`。
 - 远程操作：`push`、`pull`，需要先开启 Git 助手。
+
+推送带自动诊断：推送前检查连通与凭据（`ls-remote`）、判断两边分叉并给出中文选项；连接失败会给出分类诊断与排查步骤（**不会自动改用其它代理**——用什么通道由你在设置里决定）；推送后核对远程 hash 并报告分支去向。提交前会扫描暂存区，拦截误生成的文件、超大文件和疑似密钥。
 
 以下高风险操作不会由内置 Git 工具执行：
 
@@ -191,7 +193,8 @@ Git 助手默认关闭。开启后，AI 才能在用户明确允许的范围内�
 - 覆盖写入和编辑前会保留备份，可通过恢复工具找回上一版文件。
 - 关闭「允许直接写文件」后，AI 不能直接修改文件，只能返回明确的阻止结果。
 - Git Token 通过 IDE 的加密凭据存储处理，不落入 README、源码或普通配置文件。
-- Git 工具不提供 `reset --hard` 和 `clean`。
+- Git 工具不提供 `reset --hard` 和 `clean`；推送前先做分叉检查，不会强推。
+- 提交前扫描暂存区：误生成的文件、超大文件和疑似密钥会被拦下，确认后才能继续。
 - MCP 外部服务器由用户在设置中配置和启停；插件不会替用户猜测或填入凭据。
 - 项目仓库的 `.gitignore` 已排除 IDE 状态、构建缓存、本机配置、环境文件和常见密钥文件。
 

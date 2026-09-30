@@ -1,6 +1,8 @@
 package com.zhixueyao.tools
 
 import com.intellij.openapi.project.Project
+import com.zhixueyao.git.CommitGuard
+import com.zhixueyao.git.GitDoctor
 import com.zhixueyao.util.Json
 import com.zhixueyao.util.jsonArr
 import com.zhixueyao.util.jsonObj
@@ -42,11 +44,15 @@ class GitTool : AgentTool {
     override val name = "git"
 
     override val description =
-        "查看 git 历史与改动（status/diff/log/show/blame/branch/stash list），也能做提交（commit/add/stash）。" +
+        "查看 git 历史与改动（status/diff/log/show/blame/branch/stash list/remote），也能做提交（commit/add/stash）与合并（merge）。" +
             "理解一段代码最有效的线索常常是它的历史 —— 改代码前先看看它为什么变成现在这样。" +
             "**不做 reset --hard / clean**（这类操作会丢东西，需要用户自己在终端决定）。" +
-            "push / pull 默认也不做 —— 只有用户**主动在设置里开启 Git 助手**之后才可用，" +
-            "那时插件会按他配好的代理与账号去连，也不会改动他的 git 配置。"
+            "push / pull 默认不做 —— 只有用户**主动在设置里开启 Git 助手**之后才可用；" +
+            "开启后推送会先做预检（连通 + 凭据 + 两边分叉），失败自动分类并给出下一步" +
+            "（**不会自动改用其它代理** —— 用什么通道由用户在设置里决定），" +
+            "推完核对远程 hash 并报告去向。" +
+            "提交前自动扫一遍暂存区：误生成的文件、超大文件、疑似密钥会被拦下。" +
+            "拿不准仓库 / 远端状态时先跑 diagnose。"
 
     override val parameters: Json.Obj = jsonObj(
         "type" to "object".toJson(),
@@ -59,14 +65,17 @@ class GitTool : AgentTool {
                     "add".toJson(), "commit".toJson(), "stash_push".toJson(), "stash_pop".toJson(),
                     // push / pull 需要先在设置里开启「Git 助手」—— 没开时调它们会被挡回来，
                     // 并明确告诉你该去哪儿开。默认姿态没变：**不主动推**。
-                    "push".toJson(), "pull".toJson()
+                    "push".toJson(), "pull".toJson(),
+                    // 远端与诊断
+                    "remote".toJson(), "fetch".toJson(), "diagnose".toJson(),
+                    "merge".toJson(), "merge_abort".toJson()
                 ),
-                "description" to "要做什么。diff/show/blame 都需要 path 参数" +
-                    "。push/pull 需先在设置里启用 Git 助手"
+                "description" to "要做什么。diff/show/blame 需要 path；merge 需要 rev（如 origin/main）；" +
+                    "push/pull 需先在设置里启用 Git 助手。拿不准仓库/远端状态时先跑 diagnose"
             ),
             "remote" to jsonObj(
                 "type" to "string".toJson(),
-                "description" to "push/pull 用：远端名，默认 origin"
+                "description" to "push/pull/fetch 用：远端名，默认 origin"
             ),
             "branch" to jsonObj(
                 "type" to "string".toJson(),
@@ -82,7 +91,8 @@ class GitTool : AgentTool {
             ),
             "rev" to jsonObj(
                 "type" to "string".toJson(),
-                "description" to "修订号，如 HEAD~3、abc1234、上次提交用 HEAD。show / blame 用"
+                "description" to "修订号：show/blame 用（如 HEAD~3、abc1234、上次提交用 HEAD）；" +
+                    "merge 用（要合并进来的目标，如 origin/main）"
             ),
             "message" to jsonObj(
                 "type" to "string".toJson(),
@@ -96,15 +106,48 @@ class GitTool : AgentTool {
                 "type" to "boolean".toJson(),
                 "description" to "diff 用：只要「哪个文件改了几行」的概览。" +
                     "默认 false = 连具体改动一起给（多数情况你要的是这个）"
+            ),
+            "allow_unrelated" to jsonObj(
+                "type" to "boolean".toJson(),
+                "description" to "merge 用：允许合并**没有共同历史**的两条历史" +
+                    "（本地和远程各自 init 过的情况）。默认 false —— 先跑 diagnose 看两边关系"
+            ),
+            "allow_suspicious" to jsonObj(
+                "type" to "boolean".toJson(),
+                "description" to "commit 用：跳过「可疑文件 / 疑似密钥」检查强行提交。" +
+                    "默认 false —— 被拦下时先看清楚拦的是什么"
             )
         ),
         "required" to jsonArr("action".toJson())
     )
 
-    /** 只读动作 —— 只读预设下也放行 */
+    /**
+     * 只读动作 —— 只读预设下也放行。
+     *
+     * `remote` / `fetch` / `diagnose` 也归在这里：`fetch` 只更新远程跟踪引用
+     * （`.git/refs/remotes`），不碰工作区和历史 —— 它是「看远端」的一部分。
+     */
     private val READ_ONLY_ACTIONS = setOf(
-        "status", "diff", "log", "show", "blame", "branch", "stash_list"
+        "status", "diff", "log", "show", "blame", "branch", "stash_list",
+        "remote", "fetch", "diagnose"
     )
+
+    /**
+     * 需要**联网**的动作 —— 只有它们才套「访问方式」参数（代理 / 直连）。
+     *
+     * ## 为什么必须按动作分
+     *
+     * 其余命令全是纯本地的（`status` / `diff` / `log` / `commit` / `add` …），
+     * 给它们挂代理参数不但没用，vpn 模式下还会触发一次本机端口探测 ——
+     * 用户明确要求过：**「不要总是打开我的本地代理」**。
+     * 一条 `git status` 也去敲一轮代理端口，既慢又打扰（代理软件里能看到一串连接）。
+     *
+     * push / pull 有各自的流程（见 [pushFlow] / [pullFlow]），不走这里。
+     */
+    private val NETWORK_ACTIONS = setOf("fetch")
+
+    /** 网络类命令的超时（推送 / 拉取 / 合并可能很慢） */
+    private val NET_TIMEOUT = 120_000L
 
     override fun execute(project: Project, args: Json.Obj): ToolResult {
         val action = args.str("action")?.trim()?.lowercase().orEmpty()
@@ -147,13 +190,6 @@ class GitTool : AgentTool {
         // 注意：只有 push / pull 会被挡（见 HELPER_REQUIRED）。只读动作一律放行。
         requireHelper(action)?.let { return ToolResult.error(it) }
 
-        val cmd = buildCommand(action, args, path)
-            ?: return ToolResult.error(
-                "不认识的动作：$action\n" +
-                    "支持的是：status / diff / log / show / blame / branch / stash_list / " +
-                    "add / commit / stash_push / stash_pop"
-            )
-
         // **写动作在只读预设下要再挡一道**。
         //
         // 预设过滤是按工具名做的（`AgentPresets.READ_ONLY`），而 `git` 这个名字
@@ -172,6 +208,31 @@ class GitTool : AgentTool {
             }
         }
 
+        // ---------- 三个「不是一条命令那么简单」的动作，走各自的完整流程 ----------
+        when (action) {
+            "diagnose" -> return diagnose(base)
+            "push" -> return pushFlow(base, args)
+            "pull" -> return pullFlow(base, args)
+        }
+
+        // ---------- 提交守卫：把「没人看过」的东西拦在提交之前 ----------
+        //
+        // 真实事故：命令敲错生成的文件被 `git add -A` 卷进提交、一路推上 GitHub。
+        // 守卫只拦高置信度的（带空格的文件名 / 密钥形状 / 超大文件），
+        // 确认没问题可以带 allow_suspicious=true 跳过。
+        if (action == "commit" && args.bool("allow_suspicious") != true) {
+            val issues = CommitGuard.check(java.io.File(base))
+            if (issues.isNotEmpty()) return ToolResult.error(CommitGuard.render(issues))
+        }
+
+        val cmd = buildCommand(action, args, path)
+            ?: return ToolResult.error(
+                "不认识的动作：$action\n" +
+                    "支持的是：status / diff / log / show / blame / branch / stash_list / " +
+                    "add / commit / stash_push / stash_pop / remote / fetch / merge / merge_abort / " +
+                    "diagnose / push / pull"
+            )
+
         // 写动作前先说清楚要做什么（用户的仓库状态要变，得让他能看出来）
         if (action !in READ_ONLY_ACTIONS) {
             com.zhixueyao.agent.AgentLog.record(
@@ -185,18 +246,28 @@ class GitTool : AgentTool {
             "commit", "add", "stash_push", "stash_pop" -> 60_000L
             // blame 在大文件上很慢
             "blame" -> 90_000L
+            // 网络类（fetch/merge）可能很慢
+            "fetch", "merge", "merge_abort" -> NET_TIMEOUT
             else -> 30_000L
         }
-        // 所有 git 命令都套上「Git 助手」的访问参数（没开助手时是空操作）。
+        // 只有**真正要联网**的动作才套「访问方式」参数（代理 / 直连清空）。
         //
-        // push / pull 额外带上凭据 —— 而且**临时文件在 finally 里删掉**，
-        // 所以必须把执行包在 withCredentialFile 里，不能只把参数拼好就扔出去。
-        val r = if (action == "push" || action == "pull") {
+        // 纯本地命令（status / diff / log / commit / add …）不碰网络 ——
+        // 也就不该因为插件去探测「本机哪个端口是代理」。用户明确要求过：
+        // **「不要总是打开我的本地代理」**。所以这里按动作分流。
+        val isNetwork = action in NETWORK_ACTIONS
+        val r = if (isNetwork) {
+            // 联网命令带上凭据 —— 临时凭据文件**无论如何都会删**（见 withCredentialFile）
             withCredentialFile { credArgs ->
-                ProcessRunner.run(withAccess(cmd, credArgs), java.io.File(base), null, timeout)
+                ProcessRunner.run(
+                    withAccess(cmd, credArgs), java.io.File(base), null, timeout
+                )
             }
         } else {
-            ProcessRunner.run(withAccess(cmd), java.io.File(base), null, timeout)
+            // 本地命令：不加代理参数、不带凭据 —— 它们都用不上
+            ProcessRunner.run(
+                withAccess(cmd, includeProxy = false), java.io.File(base), null, timeout
+            )
         }
 
         val body = r.combined()
@@ -214,6 +285,251 @@ class GitTool : AgentTool {
             body.isBlank() -> ToolResult("git $action 没有输出（通常表示没有需要报告的内容）")
             else -> ToolResult(body, ok = true)
         }
+    }
+
+    // ==================== 推送 / 拉取 / 诊断 ====================
+
+    /**
+     * 推送的完整流程：**预检 → 分析 → 推送 → 核对 → 报告去向**。
+     *
+     * 为什么不再是一条 `git push` 了事 —— 用户实际经历过的四种失败，
+     * 每一种都有确定性的答案，所以每一步都在这里查掉：
+     *
+     *  1. 连不上（旧代理端口残留）→ 报错像「网络不通」，实际是配置问题
+     *     → 分类报告 + 排查步骤（**不自动改用其它代理**：用什么通道由用户决定）
+     *  2. 认证被拒（GitHub 不收密码）→ 英文报错不知道下一步
+     *     → 直接给「凭据管理器 / Token」两条路
+     *  3. `fetch first` 被拒 → 不知道远程多了什么、该合还是该推
+     *     → 先 fetch + 分析两边关系，给出中文选项，**不硬推**
+     *  4. 推完了不知道成没成（Everything up-to-date / 首页没变化）
+     *     → 推完核对远程 hash，并报告「推到了哪个分支、默认分支是哪个」
+     */
+    private fun pushFlow(base: String, args: Json.Obj): ToolResult {
+        val dir = java.io.File(base)
+        val remote = args.str("remote")?.trim()?.takeIf { it.isNotEmpty() } ?: "origin"
+
+        val branch = args.str("branch")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: GitDoctor.currentBranch(dir)
+            ?: return ToolResult.error(
+                "拿不到当前分支（可能处于 detached HEAD）。请用 branch 参数显式指定要推的分支。"
+            )
+        val head = GitDoctor.localHead(dir)
+            ?: return ToolResult.error("拿不到本地 HEAD，无法确认要推什么。")
+
+        // ---------- 1. 预检：ls-remote 同时验证「连通」和「凭据」 ----------
+        //
+        // 只用**用户自己配的**访问方式。这里刻意不做「探测到别的代理就自动换过去」——
+        // 用户明确要求：「不要总是打开我的本地代理」。配了什么就用什么，
+        // 失败了如实报告（并给出排查步骤），把「要不要换」留给用户决定。
+        val access = accessArgs()
+        val probe = GitDoctor.probeRemote(dir, remote, branch, access)
+
+        if (!probe.ok) {
+            return ToolResult.error(
+                when (GitDoctor.classify(probe.output)) {
+                    GitDoctor.FailureKind.CONNECTION -> GitDoctor.connectionHelp(dir, probe.output)
+                    GitDoctor.FailureKind.AUTH -> GitDoctor.authHelp(probe.output)
+                    GitDoctor.FailureKind.NO_REMOTE ->
+                        "没有配置远程 `$remote`。先用 remote 动作看一下有哪些远程，或让用户加一个。\n\n" +
+                            probe.output.trim().take(400)
+                    else -> "远端探测失败：\n\n```\n" + probe.output.trim().take(800) + "\n```"
+                }
+            )
+        }
+
+        // ---------- 2. 已经在远端了？（消灭「Everything up-to-date 到底成没成」） ----------
+        if (probe.hash != null && probe.hash.equals(head, ignoreCase = true)) {
+            return ToolResult(
+                "**已是最新，无需推送。** 本地 `$branch` 与 `$remote/$branch` 完全一致" +
+                    "（`${GitDoctor.short(head)}`）。"
+            )
+        }
+
+        // ---------- 3. 分析两边关系（需要先拿到远端那个提交） ----------
+        if (probe.hash != null) {
+            if (!GitDoctor.hasCommit(dir, probe.hash)) {
+                val fr = GitDoctor.run(dir, listOf("git", "fetch", remote), access, NET_TIMEOUT)
+                if (!fr.ok) {
+                    val k = GitDoctor.classify(fr.combined())
+                    return ToolResult.error(
+                        if (k == GitDoctor.FailureKind.CONNECTION) GitDoctor.connectionHelp(dir, fr.combined())
+                        else "fetch 失败：\n\n```\n" + fr.combined().trim().take(800) + "\n```"
+                    )
+                }
+            }
+            val upstream = "$remote/$branch"
+            if (!GitDoctor.mergeBaseOk(dir, upstream)) {
+                return ToolResult.error(GitDoctor.divergenceHelp(upstream, 0, 0, unrelated = true))
+            }
+            val ab = GitDoctor.aheadBehind(dir, upstream)
+            if (ab != null && ab.second > 0) {
+                return ToolResult.error(GitDoctor.divergenceHelp(upstream, ab.first, ab.second, unrelated = false))
+            }
+        }
+
+        // ---------- 4. 推送 ----------
+        val cmd = buildCommand("push", args, null)
+            ?: return ToolResult.error("内部错误：push 命令没拼出来")
+        com.zhixueyao.agent.AgentLog.record(
+            com.zhixueyao.agent.AgentLog.Kind.SESSION, "git push",
+            (cmd.drop(1).joinToString(" ") + " → $remote/$branch").take(200)
+        )
+
+        val r = withCredentialFile { credArgs ->
+            ProcessRunner.run(withAccess(cmd, credArgs), dir, null, NET_TIMEOUT)
+        }
+
+        if (!r.ok) {
+            return ToolResult.error(
+                when (GitDoctor.classify(r.combined())) {
+                    GitDoctor.FailureKind.CONNECTION -> GitDoctor.connectionHelp(dir, r.combined())
+                    GitDoctor.FailureKind.AUTH -> GitDoctor.authHelp(r.combined())
+                    GitDoctor.FailureKind.NON_FAST_FORWARD -> {
+                        val upstream = "$remote/$branch"
+                        val ab = GitDoctor.aheadBehind(dir, upstream)
+                        GitDoctor.divergenceHelp(
+                            upstream, ab?.first ?: 0, ab?.second ?: 1,
+                            unrelated = !GitDoctor.mergeBaseOk(dir, upstream)
+                        )
+                    }
+                    else -> "推送失败：\n\n```\n" + r.combined().trim().take(1200) + "\n```"
+                }
+            )
+        }
+
+        // ---------- 5. 核对：命令说成功 ≠ 远端真的更新了（hook / 保护规则会拦） ----------
+        val after = GitDoctor.probeRemote(dir, remote, branch, access)
+        val nowHead = GitDoctor.localHead(dir)
+        val verified = after.ok && after.hash != null && after.hash.equals(nowHead, ignoreCase = true)
+
+        return if (verified) {
+            ToolResult(
+                buildString {
+                    append("✅ **已推送并核对**：`$branch` → `$remote/$branch`，")
+                    append("远程 hash = `").append(GitDoctor.short(nowHead)).append("`（与本地一致）。")
+                    append(GitDoctor.destinationNote(dir, remote, branch, access))
+                }
+            )
+        } else {
+            ToolResult(
+                "推送命令执行了，但**远程 hash 与本地不一致**（可能被远端 hook / 分支保护拦下）。\n" +
+                    "- 本地 HEAD：`${GitDoctor.short(nowHead)}`\n" +
+                    "- 远程 `$remote/$branch`：`${after.hash?.let { GitDoctor.short(it) } ?: "（读不到）"}`\n\n" +
+                    "原始输出：\n```\n" + r.combined().trim().take(800) + "\n```",
+                ok = false
+            )
+        }
+    }
+
+    /**
+     * 拉取的完整流程：执行 → 失败时分类
+     * （冲突列出文件 / 认证给步骤 / 连接给排查步骤；**不自动改用其它代理**）。
+     */
+    private fun pullFlow(base: String, args: Json.Obj): ToolResult {
+        val dir = java.io.File(base)
+        val cmd = buildCommand("pull", args, null)
+            ?: return ToolResult.error("内部错误：pull 命令没拼出来")
+        com.zhixueyao.agent.AgentLog.record(
+            com.zhixueyao.agent.AgentLog.Kind.SESSION, "git pull",
+            cmd.drop(1).joinToString(" ").take(200)
+        )
+
+        val r = withCredentialFile { credArgs ->
+            ProcessRunner.run(withAccess(cmd, credArgs), dir, null, NET_TIMEOUT)
+        }
+
+        if (r.ok) {
+            return ToolResult(
+                buildString {
+                    append("✅ 已拉取。本地 HEAD 现在是 `")
+                    append(GitDoctor.short(GitDoctor.localHead(dir))).append("`。")
+                    append("\n\n").append(r.combined().trim().take(1500))
+                }
+            )
+        }
+
+        return ToolResult.error(
+            when (GitDoctor.classify(r.combined())) {
+                GitDoctor.FailureKind.CONNECTION -> GitDoctor.connectionHelp(dir, r.combined())
+                GitDoctor.FailureKind.AUTH -> GitDoctor.authHelp(r.combined())
+                GitDoctor.FailureKind.CONFLICT -> GitDoctor.conflictHelp(GitDoctor.conflictedFiles(dir))
+                else -> "拉取失败：\n\n```\n" + r.combined().trim().take(1200) + "\n```"
+            }
+        )
+    }
+
+    /**
+     * 仓库体检：一次把「在哪、远端什么关系、为什么推不动」全查出来。
+     *
+     * 纯只读（`ls-remote` 是网络读，不写任何东西）。
+     */
+    private fun diagnose(base: String): ToolResult {
+        val dir = java.io.File(base)
+        val access = accessArgs()
+        val sb = StringBuilder()
+
+        val branch = GitDoctor.currentBranch(dir)
+        val head = GitDoctor.localHead(dir)
+        val dirty = ProcessRunner.run(listOf("git", "status", "--porcelain"), dir, null, 15_000)
+            .stdout.lines().count { it.isNotBlank() }
+        val remotes = ProcessRunner.run(listOf("git", "remote", "-v"), dir, null, 10_000).stdout.trim()
+
+        sb.append("## 仓库\n")
+        sb.append("- 分支：`").append(branch ?: "（detached HEAD）").append("`，HEAD：`")
+            .append(GitDoctor.short(head)).append("`\n")
+        sb.append("- 未提交改动：").append(if (dirty == 0) "无" else "$dirty 个文件").append("\n")
+        sb.append("- 远程：\n```\n").append(remotes.ifBlank { "（没有配置远程）" }).append("\n```\n")
+
+        val remote = "origin"
+        if (branch != null) {
+            val probe = GitDoctor.probeRemote(dir, remote, branch, access)
+            sb.append("\n## 远端关系\n")
+            if (!probe.ok) {
+                val kind = GitDoctor.classify(probe.output)
+                sb.append("- **读不到远程**：\n```\n").append(probe.output.trim().take(400)).append("\n```\n")
+                when (kind) {
+                    GitDoctor.FailureKind.CONNECTION ->
+                        sb.append('\n').append(GitDoctor.connectionHelp(dir, probe.output))
+                    GitDoctor.FailureKind.AUTH ->
+                        sb.append('\n').append(GitDoctor.authHelp(probe.output))
+                    else -> {}
+                }
+            } else {
+                val def = GitDoctor.remoteDefaultBranch(dir, remote, access)
+                if (def != null) sb.append("- 远程默认分支：`").append(def).append("`\n")
+                if (probe.hash == null) {
+                    sb.append("- 远程还没有 `").append(branch).append("` 分支（push 会创建它）\n")
+                } else {
+                    sb.append("- `").append(remote).append("/").append(branch).append("` = `")
+                        .append(GitDoctor.short(probe.hash)).append("`\n")
+                    when {
+                        probe.hash.equals(head, true) ->
+                            sb.append("- 与本地**一致**（没有需要推的）\n")
+                        !GitDoctor.hasCommit(dir, probe.hash) ->
+                            sb.append("- 本地还没有远端那个提交 —— 先 `fetch` 才能比较两边差多少\n")
+                        !GitDoctor.mergeBaseOk(dir, "$remote/$branch") ->
+                            sb.append("- ⚠️ 两边**没有共同历史**（像是各自独立初始化过）\n")
+                        else -> {
+                            val ab = GitDoctor.aheadBehind(dir, "$remote/$branch")
+                            if (ab != null) {
+                                sb.append("- 本地领先 ").append(ab.first).append(" 个提交，落后 ")
+                                    .append(ab.second).append(" 个提交\n")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        sb.append("\n## 配置\n")
+        val proxy = GitDoctor.configuredProxy(dir)
+        sb.append("- git 配置里的代理：").append(if (proxy.isNullOrBlank()) "无" else "`$proxy`").append("\n")
+        val helper = ProcessRunner.run(
+            listOf("git", "config", "--global", "--get", "credential.helper"), dir, null, 8_000
+        ).stdout.trim()
+        sb.append("- 凭据管理器：").append(helper.ifBlank { "（未配置）" }).append("\n")
+
+        return ToolResult(sb.toString())
     }
 
     /**
@@ -252,8 +568,11 @@ class GitTool : AgentTool {
         return when (s.gitAccessMode) {
             "proxy" -> com.zhixueyao.git.GitProxyDetector.proxyArgs(s.gitProxyUrl)
             "vpn" -> {
+                // 用户选了「本地 VPN 工具」= 明确同意走本机代理。端口填了就只用它；
+                // 没填才探测一次（结果有 60 秒缓存 —— 免得连着跑几条 git 命令
+                // 就反复去连用户的本机端口。用户主动点「测试连接」时仍是现扫）。
                 val url = if (s.gitVpnPort > 0) "http://127.0.0.1:${s.gitVpnPort}"
-                else com.zhixueyao.git.GitProxyDetector.detectLocalProxy().proxyUrl
+                else com.zhixueyao.git.GitProxyDetector.detectLocalProxyCached().proxyUrl
                 com.zhixueyao.git.GitProxyDetector.proxyArgs(url)
             }
             else -> com.zhixueyao.git.GitProxyDetector.directArgs()
@@ -371,11 +690,20 @@ class GitTool : AgentTool {
      * 位置不能随便放：`git -c k=v <子命令>` 是合法写法，
      * 而 `git <子命令> -c k=v` **不是** —— 那样 git 会把 `-c` 当成子命令的参数，
      * 轻则报错，重则被当成路径。
+     *
+     * @param includeProxy 是否解析并注入「访问方式」参数（代理 / 直连清空）。
+     *   **只有联网动作才传 true** —— vpn 模式下解析会触发本机端口探测，
+     *   本地命令用不上，不该打扰用户（见 [NETWORK_ACTIONS]）。
      */
-    private fun withAccess(cmd: List<String>, extraCredentialArgs: List<String> = emptyList()): List<String> {
+    private fun withAccess(
+        cmd: List<String>,
+        extraCredentialArgs: List<String> = emptyList(),
+        includeProxy: Boolean = true
+    ): List<String> {
         // 署名只在 commit 时有意义 —— 给别的命令加上去只会让命令行变长
         val author = if (cmd.size > 1 && cmd[1] == "commit") authorArgs() else emptyList()
-        val extra = accessArgs() + author + extraCredentialArgs
+        val access = if (includeProxy) accessArgs() else emptyList()
+        val extra = access + author + extraCredentialArgs
         if (extra.isEmpty()) return cmd
         if (cmd.isEmpty() || cmd[0] != "git") return cmd
         return listOf("git") + extra + cmd.drop(1)
@@ -492,6 +820,21 @@ class GitTool : AgentTool {
                 args.str("message")?.trim()?.takeIf { it.isNotEmpty() }?.let { add("-m"); add(it) }
             }
             "stash_pop" -> listOf("git", "stash", "pop")
+            "remote" -> listOf("git", "remote", "-v")
+            "fetch" -> buildList {
+                add("git"); add("fetch")
+                args.str("remote")?.trim()?.takeIf { it.isNotEmpty() }?.let { add(it) }
+                args.str("branch")?.trim()?.takeIf { it.isNotEmpty() }?.let { add(it) }
+            }
+            "merge" -> {
+                val rev = args.str("rev")?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+                buildList {
+                    add("git"); add("merge"); add("--no-edit")
+                    if (args.bool("allow_unrelated") == true) add("--allow-unrelated-histories")
+                    add(rev)
+                }
+            }
+            "merge_abort" -> listOf("git", "merge", "--abort")
             else -> null
         }
 

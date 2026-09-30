@@ -307,6 +307,37 @@ object GitProxyDetector {
         }
     }
 
+    // ---------------- 带缓存的探测 ----------------
+
+    /** 缓存有效期：60 秒 */
+    private const val CACHE_TTL_MS = 60_000L
+
+    /** 最近一次的探测结果（时间戳 + 结果）。见 [detectLocalProxyCached] 的说明 */
+    @Volatile
+    private var cachedDetection: Pair<Long, Detection>? = null
+
+    /**
+     * [detectLocalProxy] 的带缓存版本：**60 秒内只真扫一次**。
+     *
+     * ## 为什么要加它
+     *
+     * 「本地 VPN 工具」模式、端口留空时，[com.zhixueyao.tools.GitTool] 的
+     * `accessArgs()` 会在**每一条 git 命令**上做一次探测 —— 而探测会连一圈
+     * 本机端口。用户明确提过：**「不要总是打开我的本地代理」**。
+     * 一条 `git status` 也去敲一轮代理端口，既慢又打扰（代理软件那边能看到一串连接）。
+     *
+     * 所以加这层 60 秒缓存：短时间内反复用同一条通道，只探一次。
+     * **用户主动点「测试连接」不走这里**（见设置页 testVpnMode）—— 那是他
+     * 要的实时结果，不该被缓存挡住。
+     */
+    fun detectLocalProxyCached(timeoutMs: Int = 400): Detection {
+        val now = System.currentTimeMillis()
+        cachedDetection?.let { if (now - it.first < CACHE_TTL_MS) return it.second }
+        val fresh = detectLocalProxy(timeoutMs = timeoutMs)
+        cachedDetection = now to fresh
+        return fresh
+    }
+
     /**
      * 找一圈，返回「所有答应了但握手没成的端口」。
      *
